@@ -21,6 +21,54 @@ if (!stripeSecretKey) {
 const stripe = Stripe(stripeSecretKey);
 const PORT = process.env.PORT || 4242;
 const SUBSCRIPTION_PRICE_ID = process.env.SUBSCRIPTION_PRICE_ID;
+const WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
+
+/**
+ * ВАЖНО:
+ * Маршрут /webhook ДОЛЖЕН идти ДО app.use(express.json()),
+ * и использовать express.raw, иначе Stripe не сможет проверить подпись.
+ */
+app.post(
+  '/webhook',
+  express.raw({ type: 'application/json' }),
+  (req, res) => {
+    if (!WEBHOOK_SECRET) {
+      console.error('Missing STRIPE_WEBHOOK_SECRET');
+      return res.status(500).send('Webhook secret not configured');
+    }
+
+    const sig = req.headers['stripe-signature'];
+    let event;
+
+    try {
+      event = stripe.webhooks.constructEvent(
+        req.body,
+        sig,
+        WEBHOOK_SECRET
+      );
+    } catch (err) {
+      console.error('❌ Webhook signature verification failed:', err.message);
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    switch (event.type) {
+      case 'payment_intent.succeeded': {
+        const paymentIntent = event.data.object;
+        console.log('✅ PaymentIntent succeeded:', paymentIntent.id);
+        break;
+      }
+      case 'checkout.session.completed': {
+        const session = event.data.object;
+        console.log('✅ Checkout Session completed:', session.id);
+        break;
+      }
+      default:
+        console.log(`ℹ️ Unhandled event type: ${event.type}`);
+    }
+
+    res.json({ received: true });
+  }
+);
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
