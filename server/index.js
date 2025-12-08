@@ -3,6 +3,7 @@ require('dotenv').config();
 const express = require('express');
 const path = require('path');
 const Stripe = require('stripe');
+const cors = require('cors');
 
 // -----------------------------------------------------
 // Конфиг цен (price_id берём из переменных окружения)
@@ -28,7 +29,22 @@ const SUBSCRIPTION_PRICE_ID = process.env.SUBSCRIPTION_PRICE_ID;
 const WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
 
 // =====================================================
-// 1) WEBHOOK — ОБЯЗАТЕЛЬНО ДО ЛЮБЫХ app.use(...)
+// 0) CORS — разрешаем фронтенд lignaggio.it
+// =====================================================
+app.use(
+  cors({
+    origin: [
+      'https://lignaggio.it',
+      'https://www.lignaggio.it',
+      'http://localhost:4242', // на будущее, для локальных тестов
+    ],
+    methods: ['GET', 'POST'],
+    allowedHeaders: ['Content-Type'],
+  })
+);
+
+// =====================================================
+// 1) WEBHOOK — ОБЯЗАТЕЛЬНО ДО ЛЮБЫХ body-parser’ов
 // =====================================================
 /**
  * Очень важно:
@@ -64,18 +80,20 @@ app.post(
         console.log('✅ PaymentIntent succeeded:', paymentIntent.id);
         break;
       }
-
-      case 'checkout.session.completed': {
-        const session = event.data.object;
-        console.log('✅ Checkout session completed:', session.id);
+      case 'invoice.payment_succeeded': {
+        const invoice = event.data.object;
+        console.log('💶 Invoice payment succeeded:', invoice.id);
         break;
       }
-
+      case 'checkout.session.completed': {
+        const session = event.data.object;
+        console.log('🧾 Checkout session completed:', session.id);
+        break;
+      }
       default:
         console.log(`ℹ️ Unhandled event type: ${event.type}`);
     }
 
-    // Stripe ждёт 2xx, иначе будет считать, что webhook упал
     res.json({ received: true });
   }
 );
@@ -93,13 +111,37 @@ app.use(express.static(path.join(__dirname, '..', 'public')));
 app.get('/config', (req, res) => {
   const publishableKey = process.env.STRIPE_PUBLISHABLE_KEY;
   if (!publishableKey) {
-    return res.status(500).json({ error: 'Missing STRIPE_PUBLISHABLE_KEY' });
+    return res
+      .status(500)
+      .json({ error: 'Missing STRIPE_PUBLISHABLE_KEY in environment' });
   }
+
   res.json({ publishableKey });
 });
 
+// -----------------------------------------------------
+// Helper: берём сумму и валюту из Stripe Price
+// -----------------------------------------------------
+async function getAmountFromPriceKey(priceKey) {
+  const stripePriceId = PRICE_MAP[priceKey];
+  if (!stripePriceId) {
+    throw new Error(`Unknown price key: ${priceKey}`);
+  }
+
+  const price = await stripe.prices.retrieve(stripePriceId);
+  if (!price || typeof price.unit_amount !== 'number') {
+    throw new Error(`Invalid Stripe price for ${stripePriceId}`);
+  }
+
+  return {
+    amount: price.unit_amount,
+    currency: price.currency || 'eur',
+    stripePriceId,
+  };
+}
+
 // =====================================================
-// 4) Создание PaymentIntent (разовый платёж)
+// 4) /create-payment-intent — разовый платёж
 // =====================================================
 app.post('/create-payment-intent', async (req, res) => {
   try {
@@ -110,42 +152,38 @@ app.post('/create-payment-intent', async (req, res) => {
     }
 
     const priceKey = String(price || '5');
-    const stripePriceId = PRICE_MAP[priceKey] || PRICE_MAP['5'];
 
-    if (!stripePriceId) {
-      return res
-        .status(500)
-        .json({ error: 'Missing Stripe price configuration' });
-    }
-
-    const stripePrice = await stripe.prices.retrieve(stripePriceId);
-
-    if (!stripePrice || typeof stripePrice.unit_amount !== 'number') {
-      return res.status(500).json({ error: 'Stripe price unavailable' });
+    let amountInfo;
+    try {
+      amountInfo = await getAmountFromPriceKey(priceKey);
+    } catch (err) {
+      console.error('Error resolving price:', err);
+      return res.status(500).json({ error: 'Price configuration error' });
     }
 
     const paymentIntent = await stripe.paymentIntents.create({
-      amount: stripePrice.unit_amount,
-      currency: stripePrice.currency || 'eur',
+      amount: amountInfo.amount,
+      currency: amountInfo.currency,
+      receipt_email: email,
       automatic_payment_methods: { enabled: true },
-      setup_future_usage: 'off_session',
       metadata: {
-        email: email,
         name: name || '',
-        arch: arch ? String(arch) : '',
+        email,
+        arch: arch || '',
         selected_price: priceKey,
+        price_id: amountInfo.stripePriceId,
       },
     });
 
     res.json({ clientSecret: paymentIntent.client_secret });
   } catch (error) {
-    console.error('Error creating PaymentIntent:', error);
+    console.error('Error creating payment intent:', error);
     res.status(500).json({ error: 'Unable to create payment intent' });
   }
 });
 
 // =====================================================
-// 5) Создание подписки
+// 5) /create-subscription — подписка
 // =====================================================
 app.post('/create-subscription', async (req, res) => {
   try {
@@ -171,16 +209,20 @@ app.post('/create-subscription', async (req, res) => {
       customer = await stripe.customers.create({
         email,
         name: name || '',
+        metadata: {
+          arch: arch || '',
+          selected_price: String(price || ''),
+        },
       });
     }
 
-    // Привязываем способ оплаты
+    // Привязываем payment method к покупателю
     try {
       await stripe.paymentMethods.attach(paymentMethodId, {
         customer: customer.id,
       });
     } catch (attachError) {
-      if (attachError && attachError.code !== 'resource_already_exists') {
+      if (!attachError || attachError.code !== 'resource_already_exists') {
         throw attachError;
       }
     }
@@ -190,20 +232,14 @@ app.post('/create-subscription', async (req, res) => {
       invoice_settings: { default_payment_method: paymentMethodId },
     });
 
-    const selectedPriceValue = price ? String(price) : '5';
-
-    // Создаём подписку
     const subscription = await stripe.subscriptions.create({
       customer: customer.id,
-      items: [{ price: SUBSCRIPTION_PRICE_ID },
-      ],
-      trial_period_days: 7,
-      default_payment_method: paymentMethodId,
-      metadata: {
-        arch: arch ? String(arch) : '',
-        selected_price: selectedPriceValue,
-      },
+      items: [{ price: SUBSCRIPTION_PRICE_ID }],
       expand: ['latest_invoice.payment_intent'],
+      metadata: {
+        arch: arch || '',
+        selected_price: String(price || ''),
+      },
     });
 
     res.json({
@@ -217,7 +253,14 @@ app.post('/create-subscription', async (req, res) => {
 });
 
 // =====================================================
-// 6) Запуск сервера
+// 6) Простой healthcheck
+// =====================================================
+app.get('/', (req, res) => {
+  res.send('Lignaggio backend is running');
+});
+
+// =====================================================
+// 7) Запуск сервера
 // =====================================================
 app.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
