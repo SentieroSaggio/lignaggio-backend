@@ -16,6 +16,9 @@ const PRICE_MAP = {
   '19': process.env.SUBSCRIPTION_PRICE_ID,
 };
 
+const AUTO_SUBSCRIPTION_PRICE_KEYS = new Set(['5', '9', '13', '17.67']);
+const SUBSCRIPTION_TRIAL_DAYS = 7;
+
 const app = express();
 const stripeSecretKey = process.env.STRIPE_SECRET_KEY;
 if (!stripeSecretKey) {
@@ -87,6 +90,12 @@ app.post(
         const customerId = paymentIntent.customer;
         const paymentMethodId = paymentIntent.payment_method;
         const metadata = paymentIntent.metadata || {};
+        const eligibleForAutoSubscription = isAutoSubscriptionEligible(metadata);
+
+        if (!eligibleForAutoSubscription) {
+          console.log('ℹ️ Price is not eligible for automatic subscription, skipping');
+          break;
+        }
 
         if (!customerId || !paymentMethodId) {
           console.warn('⚠️ Missing customer or payment method, skip subscription creation');
@@ -94,15 +103,27 @@ app.post(
         }
 
         try {
+          const alreadySubscribed = await customerHasActiveSubscription(customerId);
+
+          if (alreadySubscribed) {
+            console.log('ℹ️ Customer already has active subscription, skipping creation');
+            break;
+          }
+
           const subscription = await stripe.subscriptions.create({
             customer: customerId,
             items: [{ price: SUBSCRIPTION_PRICE_ID }],
             default_payment_method: paymentMethodId,
+            trial_period_days: SUBSCRIPTION_TRIAL_DAYS,
             metadata: {
               email: metadata.email || '',
               archetype: metadata.arch || metadata.archetype || '',
               one_time_price: metadata.selected_price || metadata.price || '',
+              origin: 'one_time_payment',
+              payment_intent: paymentIntent.id,
             },
+          }, {
+            idempotencyKey: `pi_${paymentIntent.id}_subscription`,
           });
 
           console.log('🌀 Subscription created from payment_intent:', subscription.id);
@@ -170,6 +191,39 @@ async function getAmountFromPriceKey(priceKey) {
     currency: price.currency || 'eur',
     stripePriceId,
   };
+}
+
+function isAutoSubscriptionEligible(metadata) {
+  if (!metadata) {
+    return false;
+  }
+
+  const rawPrice = String(metadata.selected_price || metadata.price || '')
+    .trim()
+    .replace(',', '.');
+
+  return AUTO_SUBSCRIPTION_PRICE_KEYS.has(rawPrice);
+}
+
+async function customerHasActiveSubscription(customerId) {
+  if (!customerId || !SUBSCRIPTION_PRICE_ID) {
+    return false;
+  }
+
+  const subscriptions = await stripe.subscriptions.list({
+    customer: customerId,
+    limit: 20,
+  });
+
+  return subscriptions.data.some((sub) => {
+    if (!sub || sub.status === 'canceled' || sub.status === 'incomplete_expired') {
+      return false;
+    }
+
+    return sub.items.data.some(
+      (item) => item.price && item.price.id === SUBSCRIPTION_PRICE_ID
+    );
+  });
 }
 
 // =====================================================
@@ -280,13 +334,23 @@ app.post('/create-subscription', async (req, res) => {
       invoice_settings: { default_payment_method: paymentMethodId },
     });
 
+    const alreadySubscribed = await customerHasActiveSubscription(customer.id);
+    if (alreadySubscribed) {
+      console.log('ℹ️ Customer already subscribed via manual endpoint, skipping creation');
+      return res.json({ status: 'already_subscribed' });
+    }
+
     const subscription = await stripe.subscriptions.create({
       customer: customer.id,
       items: [{ price: SUBSCRIPTION_PRICE_ID }],
+      default_payment_method: paymentMethodId,
+      trial_period_days: SUBSCRIPTION_TRIAL_DAYS,
       expand: ['latest_invoice.payment_intent'],
       metadata: {
         arch: arch || '',
         selected_price: String(price || ''),
+        email,
+        origin: 'manual_subscription_endpoint',
       },
     });
 
