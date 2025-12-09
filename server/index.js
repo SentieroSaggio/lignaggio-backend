@@ -13,10 +13,10 @@ const PRICE_MAP = {
   '9': process.env.PRICE_9_ID,
   '13': process.env.PRICE_13_ID,
   '17.67': process.env.PRICE_1767_ID,
+  '19': process.env.SUBSCRIPTION_PRICE_ID,
 };
 
 const app = express();
-
 const stripeSecretKey = process.env.STRIPE_SECRET_KEY;
 if (!stripeSecretKey) {
   throw new Error('Missing STRIPE_SECRET_KEY in environment');
@@ -54,7 +54,7 @@ app.use(
 app.post(
   '/webhook',
   express.raw({ type: 'application/json' }),
-  (req, res) => {
+  async (req, res) => {
     if (!WEBHOOK_SECRET) {
       console.error('❌ Missing STRIPE_WEBHOOK_SECRET in environment');
       return res.status(500).send('Webhook secret not configured');
@@ -78,6 +78,85 @@ app.post(
       case 'payment_intent.succeeded': {
         const paymentIntent = event.data.object;
         console.log('✅ PaymentIntent succeeded:', paymentIntent.id);
+
+        if (!SUBSCRIPTION_PRICE_ID) {
+          console.warn('⚠️ SUBSCRIPTION_PRICE_ID is not set, skip subscription creation');
+          break;
+        }
+
+        const metadata = paymentIntent.metadata || {};
+        const email = metadata.email;
+        const arch = metadata.arch || '';
+        const selectedPrice = metadata.selected_price || '';
+        const paymentMethodId = paymentIntent.payment_method;
+
+        if (!email || !paymentMethodId) {
+          console.warn('⚠️ Missing email or payment method, skip subscription creation');
+          break;
+        }
+
+        try {
+          const existingCustomers = await stripe.customers.list({
+            email,
+            limit: 1,
+          });
+          let customer = existingCustomers.data[0];
+
+          if (!customer) {
+            customer = await stripe.customers.create({
+              email,
+              metadata: {
+                arch,
+                selected_price: selectedPrice,
+              },
+            });
+          }
+
+          try {
+            await stripe.paymentMethods.attach(paymentMethodId, {
+              customer: customer.id,
+            });
+          } catch (attachError) {
+            if (!attachError || attachError.code !== 'resource_already_exists') {
+              throw attachError;
+            }
+          }
+
+          await stripe.customers.update(customer.id, {
+            invoice_settings: { default_payment_method: paymentMethodId },
+          });
+
+          const existingSubs = await stripe.subscriptions.list({
+            customer: customer.id,
+            status: 'active',
+            limit: 10,
+          });
+
+          const alreadyHas = existingSubs.data.some((sub) =>
+            sub.items.data.some((item) => item.price.id === SUBSCRIPTION_PRICE_ID)
+          );
+
+          if (alreadyHas) {
+            console.log('ℹ️ Customer already has active subscription, skipping creation');
+            break;
+          }
+
+          const subscription = await stripe.subscriptions.create({
+            customer: customer.id,
+            items: [{ price: SUBSCRIPTION_PRICE_ID }],
+            trial_period_days: 7,
+            metadata: {
+              arch,
+              selected_price: selectedPrice,
+              origin: 'one_time_purchase',
+            },
+          });
+
+          console.log('🌀 Subscription created from payment_intent:', subscription.id);
+        } catch (subError) {
+          console.error('❌ Failed to create subscription from payment_intent:', subError);
+        }
+
         break;
       }
       case 'invoice.payment_succeeded': {
