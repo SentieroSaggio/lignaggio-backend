@@ -84,71 +84,24 @@ app.post(
           break;
         }
 
-        const metadata = paymentIntent.metadata || {};
-        const email = metadata.email;
-        const arch = metadata.arch || '';
-        const selectedPrice = metadata.selected_price || '';
+        const customerId = paymentIntent.customer;
         const paymentMethodId = paymentIntent.payment_method;
+        const metadata = paymentIntent.metadata || {};
 
-        if (!email || !paymentMethodId) {
-          console.warn('⚠️ Missing email or payment method, skip subscription creation');
+        if (!customerId || !paymentMethodId) {
+          console.warn('⚠️ Missing customer or payment method, skip subscription creation');
           break;
         }
 
         try {
-          const existingCustomers = await stripe.customers.list({
-            email,
-            limit: 1,
-          });
-          let customer = existingCustomers.data[0];
-
-          if (!customer) {
-            customer = await stripe.customers.create({
-              email,
-              metadata: {
-                arch,
-                selected_price: selectedPrice,
-              },
-            });
-          }
-
-          try {
-            await stripe.paymentMethods.attach(paymentMethodId, {
-              customer: customer.id,
-            });
-          } catch (attachError) {
-            if (!attachError || attachError.code !== 'resource_already_exists') {
-              throw attachError;
-            }
-          }
-
-          await stripe.customers.update(customer.id, {
-            invoice_settings: { default_payment_method: paymentMethodId },
-          });
-
-          const existingSubs = await stripe.subscriptions.list({
-            customer: customer.id,
-            status: 'active',
-            limit: 10,
-          });
-
-          const alreadyHas = existingSubs.data.some((sub) =>
-            sub.items.data.some((item) => item.price.id === SUBSCRIPTION_PRICE_ID)
-          );
-
-          if (alreadyHas) {
-            console.log('ℹ️ Customer already has active subscription, skipping creation');
-            break;
-          }
-
           const subscription = await stripe.subscriptions.create({
-            customer: customer.id,
+            customer: customerId,
             items: [{ price: SUBSCRIPTION_PRICE_ID }],
-            trial_period_days: 7,
+            default_payment_method: paymentMethodId,
             metadata: {
-              arch,
-              selected_price: selectedPrice,
-              origin: 'one_time_purchase',
+              email: metadata.email || '',
+              archetype: metadata.arch || metadata.archetype || '',
+              one_time_price: metadata.selected_price || metadata.price || '',
             },
           });
 
@@ -224,11 +177,13 @@ async function getAmountFromPriceKey(priceKey) {
 // =====================================================
 app.post('/create-payment-intent', async (req, res) => {
   try {
-    const { name, email, arch, price } = req.body || {};
+    const { name, email, arch, archetype, price } = req.body || {};
 
     if (!email) {
       return res.status(400).json({ error: 'Missing email' });
     }
+
+    const archetypeValue = arch ?? archetype ?? '';
 
     const priceKey = String(price || '5');
 
@@ -240,15 +195,29 @@ app.post('/create-payment-intent', async (req, res) => {
       return res.status(500).json({ error: 'Price configuration error' });
     }
 
+    const existingCustomers = await stripe.customers.list({ email, limit: 1 });
+    let customer;
+    if (existingCustomers.data.length > 0) {
+      customer = existingCustomers.data[0];
+    } else {
+      customer = await stripe.customers.create({
+        email,
+        name: name || '',
+        metadata: { arch: archetypeValue, selected_price: priceKey },
+      });
+    }
+
     const paymentIntent = await stripe.paymentIntents.create({
       amount: amountInfo.amount,
       currency: amountInfo.currency,
       receipt_email: email,
       automatic_payment_methods: { enabled: true },
+      customer: customer.id,
+      setup_future_usage: 'off_session',
       metadata: {
         name: name || '',
         email,
-        arch: arch || '',
+        arch: archetypeValue,
         selected_price: priceKey,
         price_id: amountInfo.stripePriceId,
       },
