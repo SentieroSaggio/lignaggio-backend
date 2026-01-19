@@ -9,6 +9,9 @@ const cors = require('cors');
 // Конфиг цен (price_id берём из переменных окружения)
 // -----------------------------------------------------
 const PRICE_MAP = {
+  '1.59': process.env.PRICE_159_ID,
+  '3.59': process.env.PRICE_359_ID,
+  '7.59': process.env.PRICE_759_ID,
   '5': process.env.PRICE_5_ID,
   '9': process.env.PRICE_9_ID,
   '13': process.env.PRICE_13_ID,
@@ -16,7 +19,7 @@ const PRICE_MAP = {
   '19': process.env.SUBSCRIPTION_PRICE_ID,
 };
 
-const AUTO_SUBSCRIPTION_PRICE_KEYS = new Set(['5', '9', '13', '17.67']);
+const AUTO_SUBSCRIPTION_PRICE_KEYS = new Set(['1.59', '3.59', '7.59', '5', '9', '13', '17.67']);
 const SUBSCRIPTION_TRIAL_DAYS = 7;
 
 const app = express();
@@ -176,6 +179,8 @@ app.get('/config', (req, res) => {
 // Helper: берём сумму и валюту из Stripe Price
 // -----------------------------------------------------
 async function getAmountFromPriceKey(priceKey) {
+  priceKey = String(priceKey).trim().replace(',', '.');
+  console.log('DEBUG PRICE_MAP[1.59]=', PRICE_MAP['1.59'], 'priceKey=', JSON.stringify(priceKey));
   const stripePriceId = PRICE_MAP[priceKey];
   if (!stripePriceId) {
     throw new Error(`Unknown price key: ${priceKey}`);
