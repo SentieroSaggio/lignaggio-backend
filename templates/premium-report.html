@@ -1,0 +1,811 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Consulenza di Compatibilità — {{P1_NAME}} & {{P2_NAME}}</title>
+<style>
+  /* ── Fonts ── */
+  @import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,600;0,700;1,400;1,600&family=Inter:wght@300;400;500;600&display=swap');
+
+  /* ── Design tokens ── */
+  :root {
+    --purple-deep:  #1a0a2e;
+    --purple-mid:   #2d1060;
+    --purple-vivid: #6f4dff;
+    --purple-light: #b46aff;
+    --purple-glow:  #da8fff;
+    --pink:         #ff6dae;
+    --gold:         #e8c96a;
+    --gold-light:   #f5e09a;
+    --text-primary: #f0eaff;
+    --text-muted:   rgba(218,208,240,0.65);
+    --text-dark:    #1a0a2e;
+    --glass-bg:     rgba(255,255,255,0.04);
+    --glass-border: rgba(180,100,255,0.18);
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  html, body {
+    width: 210mm;
+    font-family: 'Inter', sans-serif;
+    background: var(--purple-deep);
+    color: var(--text-primary);
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+
+  /* ── Page breaks ── */
+  .page {
+    width: 210mm;
+    min-height: 297mm;
+    position: relative;
+    page-break-after: always;
+    overflow: hidden;
+  }
+  .page:last-child { page-break-after: auto; }
+
+  /* ════════════════════════════════════════════════
+     PAGE 1 — COVER
+  ════════════════════════════════════════════════ */
+  .cover {
+    background: linear-gradient(160deg, #12052a 0%, #1f0846 45%, #0f0320 100%);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 40mm 20mm;
+    text-align: center;
+    position: relative;
+  }
+  .cover::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background:
+      radial-gradient(ellipse 70% 40% at 50% 20%, rgba(111,77,255,0.18) 0%, transparent 70%),
+      radial-gradient(ellipse 50% 30% at 50% 85%, rgba(180,100,255,0.10) 0%, transparent 70%);
+    pointer-events: none;
+  }
+
+  .cover-badge {
+    font-family: 'Inter', sans-serif;
+    font-size: 8pt;
+    font-weight: 600;
+    letter-spacing: 0.3em;
+    color: var(--purple-glow);
+    text-transform: uppercase;
+    margin-bottom: 12mm;
+    opacity: 0.8;
+  }
+
+  .cover-glyph {
+    font-size: 24pt;
+    color: var(--purple-light);
+    margin-bottom: 6mm;
+    letter-spacing: 0.3em;
+    filter: drop-shadow(0 0 12px rgba(180,100,255,0.6));
+  }
+
+  .cover-title {
+    font-family: 'Cormorant Garamond', serif;
+    font-size: 28pt;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    color: #fff;
+    line-height: 1.15;
+    margin-bottom: 3mm;
+  }
+
+  .cover-subtitle {
+    font-family: 'Cormorant Garamond', serif;
+    font-size: 13pt;
+    font-weight: 400;
+    font-style: italic;
+    color: var(--purple-glow);
+    letter-spacing: 0.08em;
+    margin-bottom: 14mm;
+  }
+
+  /* Partners row */
+  .cover-partners {
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    gap: 0;
+    width: 100%;
+    margin-bottom: 12mm;
+  }
+  .cover-partner {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 6mm 8mm;
+    background: rgba(255,255,255,0.035);
+    border: 1px solid rgba(180,100,255,0.20);
+    border-radius: 12px;
+    max-width: 68mm;
+  }
+  .cover-partner-label {
+    font-size: 7pt;
+    font-weight: 600;
+    letter-spacing: 0.25em;
+    color: var(--purple-light);
+    text-transform: uppercase;
+    margin-bottom: 3mm;
+  }
+  .cover-partner-name {
+    font-family: 'Cormorant Garamond', serif;
+    font-size: 17pt;
+    font-weight: 700;
+    color: var(--text-primary);
+    margin-bottom: 2mm;
+  }
+  .cover-partner-birth {
+    font-size: 9pt;
+    color: var(--text-muted);
+    letter-spacing: 0.05em;
+  }
+  .cover-divider {
+    width: 16mm;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-direction: column;
+    gap: 2mm;
+    padding-top: 10mm;
+  }
+  .cover-divider-sym {
+    color: var(--gold);
+    font-size: 14pt;
+    line-height: 1;
+  }
+  .cover-divider-line {
+    width: 1px;
+    height: 8mm;
+    background: linear-gradient(to bottom, transparent, var(--purple-light), transparent);
+  }
+
+  /* Score circle */
+  .cover-score-wrap {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    margin-bottom: 10mm;
+  }
+  .cover-score-label {
+    font-size: 7.5pt;
+    font-weight: 600;
+    letter-spacing: 0.25em;
+    color: var(--purple-glow);
+    text-transform: uppercase;
+    margin-bottom: 4mm;
+  }
+  .cover-score-circle {
+    width: 36mm;
+    height: 36mm;
+  }
+  .score-ring-bg { fill: none; stroke: rgba(111,77,255,0.15); stroke-width: 5; }
+  .score-ring-fill {
+    fill: none;
+    stroke: url(#scoreGradient);
+    stroke-width: 5;
+    stroke-linecap: round;
+    transition: stroke-dashoffset 0.6s ease;
+  }
+  .score-text-num {
+    font-family: 'Cormorant Garamond', serif;
+    font-size: 22pt;
+    font-weight: 700;
+    fill: #fff;
+  }
+  .score-text-pct {
+    font-family: 'Inter', sans-serif;
+    font-size: 9pt;
+    fill: var(--purple-glow);
+  }
+
+  .cover-footer-line {
+    font-size: 7.5pt;
+    letter-spacing: 0.15em;
+    color: rgba(180,100,255,0.38);
+    text-transform: uppercase;
+    margin-top: 10mm;
+  }
+
+  /* ════════════════════════════════════════════════
+     SHARED INNER PAGE
+  ════════════════════════════════════════════════ */
+  .inner-page {
+    background: linear-gradient(170deg, #110428 0%, #1c0840 100%);
+    padding: 18mm 16mm 14mm;
+    position: relative;
+  }
+  .inner-page::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 2px;
+    background: linear-gradient(to right, transparent, var(--purple-vivid), transparent);
+  }
+
+  .page-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 8mm;
+    padding-bottom: 3mm;
+    border-bottom: 1px solid rgba(180,100,255,0.12);
+  }
+  .page-header-title {
+    font-size: 7pt;
+    font-weight: 600;
+    letter-spacing: 0.22em;
+    color: var(--purple-light);
+    text-transform: uppercase;
+  }
+  .page-header-names {
+    font-size: 7pt;
+    color: var(--text-muted);
+    letter-spacing: 0.05em;
+  }
+
+  .section-title {
+    font-family: 'Cormorant Garamond', serif;
+    font-size: 20pt;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    color: var(--text-primary);
+    margin-bottom: 6mm;
+    line-height: 1.15;
+  }
+  .section-title span {
+    color: var(--purple-glow);
+  }
+
+  .section-eyebrow {
+    font-size: 7pt;
+    font-weight: 600;
+    letter-spacing: 0.28em;
+    color: var(--purple-light);
+    text-transform: uppercase;
+    margin-bottom: 2mm;
+  }
+
+  p {
+    font-size: 9.5pt;
+    line-height: 1.7;
+    color: rgba(218,208,240,0.82);
+    margin-bottom: 4mm;
+  }
+  p:last-child { margin-bottom: 0; }
+  p strong { color: rgba(220,190,255,1); font-weight: 600; }
+  p em { color: rgba(200,170,255,0.9); font-style: italic; }
+
+  /* ════════════════════════════════════════════════
+     PAGE 2 — OVERVIEW
+  ════════════════════════════════════════════════ */
+  .overview-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 5mm;
+    margin-bottom: 6mm;
+  }
+  .overview-card {
+    background: rgba(255,255,255,0.035);
+    border: 1px solid rgba(180,100,255,0.15);
+    border-radius: 10px;
+    padding: 5mm;
+  }
+  .overview-card-label {
+    font-size: 7pt;
+    font-weight: 600;
+    letter-spacing: 0.2em;
+    color: var(--purple-light);
+    text-transform: uppercase;
+    margin-bottom: 2mm;
+  }
+  .overview-card-val {
+    font-family: 'Cormorant Garamond', serif;
+    font-size: 13pt;
+    font-weight: 700;
+    color: var(--text-primary);
+  }
+
+  /* ════════════════════════════════════════════════
+     PAGE 3 — CHART
+  ════════════════════════════════════════════════ */
+  .chart-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6mm;
+    align-items: start;
+  }
+  .chart-panel {
+    background: rgba(255,255,255,0.03);
+    border: 1px solid rgba(180,100,255,0.13);
+    border-radius: 12px;
+    padding: 6mm;
+  }
+  .chart-panel-title {
+    font-size: 7pt;
+    font-weight: 600;
+    letter-spacing: 0.2em;
+    color: var(--purple-light);
+    text-transform: uppercase;
+    margin-bottom: 4mm;
+  }
+
+  /* Radar / bar chart sectors */
+  .sector-bars { display: flex; flex-direction: column; gap: 3mm; }
+  .sector-row {
+    display: flex;
+    align-items: center;
+    gap: 3mm;
+  }
+  .sector-label {
+    font-size: 7.5pt;
+    color: var(--text-muted);
+    width: 34mm;
+    flex-shrink: 0;
+    letter-spacing: 0.02em;
+  }
+  .sector-bar-track {
+    flex: 1;
+    height: 5px;
+    background: rgba(255,255,255,0.07);
+    border-radius: 3px;
+    overflow: hidden;
+  }
+  .sector-bar-fill {
+    height: 100%;
+    border-radius: 3px;
+    background: linear-gradient(to right, var(--purple-vivid), var(--pink));
+  }
+  .sector-pct {
+    font-size: 7.5pt;
+    font-weight: 600;
+    color: var(--purple-glow);
+    width: 10mm;
+    text-align: right;
+  }
+
+  /* Trend arrows / candle indicators */
+  .trading-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 3mm;
+    margin-top: 4mm;
+  }
+  .trading-box {
+    background: rgba(255,255,255,0.028);
+    border: 1px solid rgba(180,100,255,0.12);
+    border-radius: 8px;
+    padding: 4mm;
+    display: flex;
+    flex-direction: column;
+    gap: 2mm;
+  }
+  .trading-box-label {
+    font-size: 6.5pt;
+    letter-spacing: 0.15em;
+    color: var(--text-muted);
+    text-transform: uppercase;
+  }
+  .trading-box-val {
+    font-family: 'Cormorant Garamond', serif;
+    font-size: 14pt;
+    font-weight: 700;
+    color: var(--text-primary);
+    line-height: 1;
+  }
+  .trading-box-arrow {
+    font-size: 10pt;
+    line-height: 1;
+  }
+  .arrow-up   { color: #4ade80; }
+  .arrow-down { color: #f87171; }
+  .arrow-flat { color: var(--gold); }
+
+  /* ════════════════════════════════════════════════
+     PAGE 4+ — SECTORS
+  ════════════════════════════════════════════════ */
+  .consult-block {
+    background: rgba(255,255,255,0.028);
+    border: 1px solid rgba(180,100,255,0.13);
+    border-radius: 12px;
+    padding: 5mm 6mm;
+    margin-bottom: 4mm;
+    page-break-inside: avoid;
+  }
+  .consult-block-head {
+    display: flex;
+    align-items: center;
+    gap: 3mm;
+    margin-bottom: 3mm;
+  }
+  .consult-block-num {
+    width: 7mm; height: 7mm;
+    border-radius: 50%;
+    background: rgba(111,77,255,0.15);
+    border: 1px solid rgba(111,77,255,0.30);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 6.5pt; font-weight: 700;
+    color: rgba(180,100,255,0.9);
+    flex-shrink: 0;
+  }
+  .consult-block-title {
+    font-family: 'Cormorant Garamond', serif;
+    font-size: 12pt;
+    font-weight: 700;
+    color: rgba(220,200,255,0.95);
+    letter-spacing: 0.05em;
+  }
+  .consult-block-pct {
+    margin-left: auto;
+    font-size: 7.5pt;
+    font-weight: 600;
+    color: var(--purple-glow);
+    letter-spacing: 0.05em;
+  }
+  .consult-block-body p {
+    font-size: 9pt;
+    margin-bottom: 2.5mm;
+  }
+
+  /* ════════════════════════════════════════════════
+     LAST PAGE — FINAL ADVICE
+  ════════════════════════════════════════════════ */
+  .final-block {
+    background: linear-gradient(140deg, rgba(111,77,255,0.10) 0%, rgba(255,109,174,0.06) 100%);
+    border: 1px solid rgba(200,100,255,0.20);
+    border-radius: 14px;
+    padding: 7mm 8mm;
+    margin-top: 6mm;
+    page-break-inside: avoid;
+  }
+  .final-block .consult-block-title { font-size: 14pt; color: var(--gold-light); }
+  .final-glyph {
+    text-align: center;
+    font-size: 12pt;
+    color: rgba(180,100,255,0.45);
+    letter-spacing: 0.4em;
+    margin-top: 8mm;
+  }
+  .report-footer {
+    margin-top: 8mm;
+    padding-top: 3mm;
+    border-top: 1px solid rgba(180,100,255,0.10);
+    font-size: 7pt;
+    color: rgba(180,100,255,0.35);
+    text-align: center;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+  }
+</style>
+</head>
+<body>
+
+<!-- ══════════════════════════════════════════════════════════
+     PAGE 1 — COVER
+════════════════════════════════════════════════════════════ -->
+<div class="page cover">
+
+  <div class="cover-badge">Lettura Personale di Compatibilità</div>
+  <div class="cover-glyph">✦ ✦ ✦</div>
+  <div class="cover-title">Consulenza di Compatibilità</div>
+  <div class="cover-subtitle">Matrice di Compatibilità · Numerologia · Astrologia</div>
+
+  <div class="cover-partners">
+    <div class="cover-partner">
+      <div class="cover-partner-label">Partner A</div>
+      <div class="cover-partner-name">{{P1_NAME}}</div>
+      <div class="cover-partner-birth">{{P1_BIRTH}}</div>
+    </div>
+    <div class="cover-divider">
+      <div class="cover-divider-line"></div>
+      <div class="cover-divider-sym">✦</div>
+      <div class="cover-divider-line"></div>
+    </div>
+    <div class="cover-partner">
+      <div class="cover-partner-label">Partner B</div>
+      <div class="cover-partner-name">{{P2_NAME}}</div>
+      <div class="cover-partner-birth">{{P2_BIRTH}}</div>
+    </div>
+  </div>
+
+  <div class="cover-score-wrap">
+    <div class="cover-score-label">Score di Compatibilità</div>
+    <svg class="cover-score-circle" viewBox="0 0 120 120">
+      <defs>
+        <linearGradient id="scoreGradient" x1="0%" y1="0%" x2="100%" y2="0%">
+          <stop offset="0%"   stop-color="#6f4dff"/>
+          <stop offset="100%" stop-color="#ff6dae"/>
+        </linearGradient>
+      </defs>
+      <circle class="score-ring-bg" cx="60" cy="60" r="50"/>
+      <circle class="score-ring-fill" cx="60" cy="60" r="50"
+        stroke-dasharray="314"
+        stroke-dashoffset="{{SCORE_OFFSET}}"
+        transform="rotate(-90 60 60)"/>
+      <text class="score-text-num" x="60" y="62" text-anchor="middle" dominant-baseline="middle">{{SCORE}}</text>
+      <text class="score-text-pct" x="60" y="80" text-anchor="middle">compatibilità</text>
+    </svg>
+  </div>
+
+  <div class="cover-footer-line">lignaggio.it · Lettura riservata e personale</div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════
+     PAGE 2 — OVERVIEW
+════════════════════════════════════════════════════════════ -->
+<div class="page inner-page">
+  <div class="page-header">
+    <span class="page-header-title">Panorama Generale</span>
+    <span class="page-header-names">{{P1_NAME}} &amp; {{P2_NAME}}</span>
+  </div>
+
+  <div class="section-eyebrow">01 — Lettura della coppia</div>
+  <h2 class="section-title">COMPATIBILITY<br><span>OVERVIEW</span></h2>
+
+  <div class="overview-grid">
+    <div class="overview-card">
+      <div class="overview-card-label">Archetipo {{P1_NAME}}</div>
+      <div class="overview-card-val">{{P1_ARCH_LABEL}}</div>
+    </div>
+    <div class="overview-card">
+      <div class="overview-card-label">Archetipo {{P2_NAME}}</div>
+      <div class="overview-card-val">{{P2_ARCH_LABEL}}</div>
+    </div>
+    <div class="overview-card">
+      <div class="overview-card-label">Score Globale</div>
+      <div class="overview-card-val">{{SCORE}}%</div>
+    </div>
+    <div class="overview-card">
+      <div class="overview-card-label">Fascia</div>
+      <div class="overview-card-val">{{BAND}}</div>
+    </div>
+  </div>
+
+  <div id="sec-panorama-pdf">{{PANORAMA_HTML}}</div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════
+     PAGE 3 — CHART
+════════════════════════════════════════════════════════════ -->
+<div class="page inner-page">
+  <div class="page-header">
+    <span class="page-header-title">Analisi Visiva</span>
+    <span class="page-header-names">{{P1_NAME}} &amp; {{P2_NAME}}</span>
+  </div>
+
+  <div class="section-eyebrow">02 — Grafico di Compatibilità</div>
+  <h2 class="section-title">COMPATIBILITY<br><span>CHART</span></h2>
+
+  <div class="chart-grid">
+    <!-- Sector bars -->
+    <div class="chart-panel">
+      <div class="chart-panel-title">Settori di Compatibilità</div>
+      <div class="sector-bars">
+        <div class="sector-row">
+          <div class="sector-label">Connessione emotiva</div>
+          <div class="sector-bar-track"><div class="sector-bar-fill" style="width:{{EM_PCT}}%"></div></div>
+          <div class="sector-pct">{{EM_PCT}}%</div>
+        </div>
+        <div class="sector-row">
+          <div class="sector-label">Comunicazione</div>
+          <div class="sector-bar-track"><div class="sector-bar-fill" style="width:{{COM_PCT}}%"></div></div>
+          <div class="sector-pct">{{COM_PCT}}%</div>
+        </div>
+        <div class="sector-row">
+          <div class="sector-label">Valori condivisi</div>
+          <div class="sector-bar-track"><div class="sector-bar-fill" style="width:{{VAL_PCT}}%"></div></div>
+          <div class="sector-pct">{{VAL_PCT}}%</div>
+        </div>
+        <div class="sector-row">
+          <div class="sector-label">Potenziale futuro</div>
+          <div class="sector-bar-track"><div class="sector-bar-fill" style="width:{{POT_PCT}}%"></div></div>
+          <div class="sector-pct">{{POT_PCT}}%</div>
+        </div>
+        <div class="sector-row">
+          <div class="sector-label">Intimità</div>
+          <div class="sector-bar-track"><div class="sector-bar-fill" style="width:{{INT_PCT}}%"></div></div>
+          <div class="sector-pct">{{INT_PCT}}%</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Circular SVG chart -->
+    <div class="chart-panel">
+      <div class="chart-panel-title">Distribuzione Energetica</div>
+      <svg viewBox="0 0 160 160" style="width:100%;max-width:55mm;display:block;margin:0 auto">
+        <defs>
+          <linearGradient id="cg1" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stop-color="#6f4dff"/>
+            <stop offset="100%" stop-color="#ff6dae"/>
+          </linearGradient>
+          <linearGradient id="cg2" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stop-color="#e8c96a"/>
+            <stop offset="100%" stop-color="#b46aff"/>
+          </linearGradient>
+        </defs>
+        <!-- Outer ring -->
+        <circle cx="80" cy="80" r="68" fill="none" stroke="rgba(111,77,255,0.08)" stroke-width="24"/>
+        <!-- Segments -->
+        <circle cx="80" cy="80" r="68" fill="none" stroke="url(#cg1)" stroke-width="24"
+          stroke-dasharray="{{CHART_SEG1}} {{CHART_REST1}}" stroke-dashoffset="{{CHART_OFF1}}"
+          transform="rotate(-90 80 80)" stroke-linecap="butt"/>
+        <circle cx="80" cy="80" r="68" fill="none" stroke="url(#cg2)" stroke-width="24"
+          stroke-dasharray="{{CHART_SEG2}} {{CHART_REST2}}" stroke-dashoffset="{{CHART_OFF2}}"
+          transform="rotate(-90 80 80)" stroke-linecap="butt"/>
+        <circle cx="80" cy="80" r="68" fill="none" stroke="rgba(255,109,174,0.35)" stroke-width="24"
+          stroke-dasharray="{{CHART_SEG3}} {{CHART_REST3}}" stroke-dashoffset="{{CHART_OFF3}}"
+          transform="rotate(-90 80 80)" stroke-linecap="butt"/>
+        <!-- Inner circle -->
+        <circle cx="80" cy="80" r="52" fill="rgba(26,10,46,0.85)"/>
+        <text x="80" y="73" text-anchor="middle" font-family="Cormorant Garamond,serif" font-size="22" font-weight="700" fill="white">{{SCORE}}</text>
+        <text x="80" y="91" text-anchor="middle" font-family="Inter,sans-serif" font-size="9" fill="rgba(200,170,255,0.75)">su 100</text>
+      </svg>
+    </div>
+  </div>
+
+  <!-- Trading-style indicators -->
+  <div style="margin-top:5mm">
+    <div class="chart-panel-title" style="margin-bottom:3mm;font-size:7pt;font-weight:600;letter-spacing:0.2em;color:var(--purple-light);text-transform:uppercase">Indicatori di Tendenza</div>
+    <div class="trading-grid">
+      <div class="trading-box">
+        <div class="trading-box-label">Trend Relazione</div>
+        <div style="display:flex;align-items:center;gap:2mm">
+          <div class="trading-box-val">{{TREND_LABEL}}</div>
+          <div class="trading-box-arrow {{TREND_ARROW_CLASS}}">{{TREND_ARROW}}</div>
+        </div>
+      </div>
+      <div class="trading-box">
+        <div class="trading-box-label">Crescita Compatibilità</div>
+        <div style="display:flex;align-items:center;gap:2mm">
+          <div class="trading-box-val">{{GROWTH_LABEL}}</div>
+          <div class="trading-box-arrow {{GROWTH_ARROW_CLASS}}">{{GROWTH_ARROW}}</div>
+        </div>
+      </div>
+      <div class="trading-box">
+        <div class="trading-box-label">Forza Emotiva</div>
+        <div style="display:flex;align-items:center;gap:2mm">
+          <div class="trading-box-val">{{EM_PCT}}%</div>
+          <div class="trading-box-arrow arrow-up">▲</div>
+        </div>
+      </div>
+      <div class="trading-box">
+        <div class="trading-box-label">Allineamento Valori</div>
+        <div style="display:flex;align-items:center;gap:2mm">
+          <div class="trading-box-val">{{VAL_PCT}}%</div>
+          <div class="trading-box-arrow {{VAL_ARROW_CLASS}}">{{VAL_ARROW}}</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════
+     PAGE 4 — PARTNER ARCHETYPES
+════════════════════════════════════════════════════════════ -->
+<div class="page inner-page">
+  <div class="page-header">
+    <span class="page-header-title">Ritratti Archetipici</span>
+    <span class="page-header-names">{{P1_NAME}} &amp; {{P2_NAME}}</span>
+  </div>
+
+  <div class="section-eyebrow">03 — Archetipo individuale</div>
+  <h2 class="section-title">PROFILI<br><span>ARCHETIPICI</span></h2>
+
+  <div class="consult-block">
+    <div class="consult-block-head">
+      <div class="consult-block-num">02</div>
+      <div class="consult-block-title">{{P1_NAME}} — {{P1_ARCH_LABEL}}</div>
+    </div>
+    <div class="consult-block-body">{{PARTNER1_HTML}}</div>
+  </div>
+
+  <div class="consult-block">
+    <div class="consult-block-head">
+      <div class="consult-block-num">03</div>
+      <div class="consult-block-title">{{P2_NAME}} — {{P2_ARCH_LABEL}}</div>
+    </div>
+    <div class="consult-block-body">{{PARTNER2_HTML}}</div>
+  </div>
+
+  <div class="consult-block">
+    <div class="consult-block-head">
+      <div class="consult-block-num">04</div>
+      <div class="consult-block-title">Archetipo della Coppia</div>
+    </div>
+    <div class="consult-block-body">{{COUPLE_HTML}}</div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════
+     PAGE 5 — ANIMA / KARMA / INTIMITÀ
+════════════════════════════════════════════════════════════ -->
+<div class="page inner-page">
+  <div class="page-header">
+    <span class="page-header-title">Settori Relazionali</span>
+    <span class="page-header-names">{{P1_NAME}} &amp; {{P2_NAME}}</span>
+  </div>
+
+  <div class="section-eyebrow">04 — Dinamiche profonde</div>
+  <h2 class="section-title">SETTORI<br><span>RELAZIONALI</span></h2>
+
+  <div class="consult-block">
+    <div class="consult-block-head">
+      <div class="consult-block-num">05</div>
+      <div class="consult-block-title">Connessione Anima</div>
+      <div class="consult-block-pct">{{EM_PCT}}%</div>
+    </div>
+    <div class="consult-block-body">{{ANIMA_HTML}}</div>
+  </div>
+
+  <div class="consult-block">
+    <div class="consult-block-head">
+      <div class="consult-block-num">06</div>
+      <div class="consult-block-title">Dinamica Karma</div>
+    </div>
+    <div class="consult-block-body">{{KARMA_HTML}}</div>
+  </div>
+
+  <div class="consult-block">
+    <div class="consult-block-head">
+      <div class="consult-block-num">07</div>
+      <div class="consult-block-title">Intimità e Risonanza Emotiva</div>
+      <div class="consult-block-pct">{{INT_PCT}}%</div>
+    </div>
+    <div class="consult-block-body">{{INTIMITA_HTML}}</div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════
+     PAGE 6 — FINANZE / POTENZIALE / CONSIGLIO
+════════════════════════════════════════════════════════════ -->
+<div class="page inner-page">
+  <div class="page-header">
+    <span class="page-header-title">Crescita e Consiglio</span>
+    <span class="page-header-names">{{P1_NAME}} &amp; {{P2_NAME}}</span>
+  </div>
+
+  <div class="section-eyebrow">05 — Prospettive</div>
+  <h2 class="section-title">CRESCITA &amp;<br><span>CONSIGLIO FINALE</span></h2>
+
+  <div class="consult-block">
+    <div class="consult-block-head">
+      <div class="consult-block-num">08</div>
+      <div class="consult-block-title">Finanze e Costruzione Materiale</div>
+      <div class="consult-block-pct">{{VAL_PCT}}%</div>
+    </div>
+    <div class="consult-block-body">{{FINANZE_HTML}}</div>
+  </div>
+
+  <div class="consult-block">
+    <div class="consult-block-head">
+      <div class="consult-block-num">09</div>
+      <div class="consult-block-title">Potenziale Evolutivo della Relazione</div>
+      <div class="consult-block-pct">{{POT_PCT}}%</div>
+    </div>
+    <div class="consult-block-body">{{POTENTIALE_HTML}}</div>
+  </div>
+
+  <div class="final-block">
+    <div class="consult-block-head">
+      <div class="consult-block-num" style="background:linear-gradient(135deg,rgba(180,100,255,.20),rgba(255,109,174,.12));border-color:rgba(200,100,255,.40);color:rgba(220,165,255,.95)">10</div>
+      <div class="consult-block-title">✦ Consiglio Finale</div>
+    </div>
+    <div class="consult-block-body">{{CONSIGLIO_HTML}}</div>
+  </div>
+
+  <div class="final-glyph">✦ ✦ ✦</div>
+  <div class="report-footer">
+    © Lettura basata su Matrice di Compatibilità, Numerologia e Astrologia · lignaggio.it
+  </div>
+</div>
+
+</body>
+</html>

@@ -10,6 +10,9 @@ const crypto = require('crypto');
 // ── Persistent storage (SQLite via better-sqlite3) ─────────────────────────
 const db = require('../db');
 
+// ── PDF generator ─────────────────────────────────────────────────────────
+const { generatePremiumPDF } = require('../services/pdfGenerator');
+
 // -----------------------------------------------------
 // Конфиг цен (price_id берём из переменных окружения)
 // -----------------------------------------------------
@@ -772,6 +775,26 @@ async function generateFullConsultation(calculationId) {
         console.error('[email] sendConsultationEmail error for:', calculationId, err.message);
       });
 
+      // Generate premium PDF (fire-and-forget)
+      const pdfData = {
+        partner1:      partnerData.partner1,
+        partner2:      partnerData.partner2,
+        compatibility: partnerData.compatibility,
+        consultation:  parsed,
+      };
+      generatePremiumPDF(pdfData, calculationId).then(function (pdfPath) {
+        console.log('[pdf] Premium PDF ready for:', calculationId, pdfPath);
+        // Update DB pdf_url
+        try {
+          const existing = db.getConsultation(calculationId);
+          if (existing) {
+            db.insertConsultation(calculationId, parsed, null, pdfPath);
+          }
+        } catch (_) {}
+      }).catch(function (err) {
+        console.error('[pdf] generatePremiumPDF error for:', calculationId, err.message);
+      });
+
       console.log('[FULL CONSULTATION GENERATED] calculation_id:', calculationId);
       return true;
 
@@ -1360,6 +1383,74 @@ app.get('/api/session/:calculationId', function (req, res) {
       paymentStatus: row.payment_status || 'pending',
     },
   });
+});
+
+// =====================================================
+// GET /api/report/:calculation_id — Download premium PDF
+// =====================================================
+app.get('/api/report/:calculation_id', function (req, res) {
+  const calculationId = String(req.params.calculation_id || '').trim();
+  if (!calculationId) {
+    return res.status(400).json({ error: 'Missing calculation_id' });
+  }
+
+  // Verify payment
+  const row = db.getSession(calculationId);
+  if (!row) {
+    return res.status(404).json({ error: 'Session not found' });
+  }
+  if (row.payment_status !== 'paid') {
+    return res.status(402).json({ error: 'Payment required' });
+  }
+
+  const path = require('path');
+  const fs   = require('fs');
+  const pdfPath = path.join(__dirname, '..', 'storage', 'reports', 'report_' + calculationId + '.pdf');
+
+  if (!fs.existsSync(pdfPath)) {
+    // PDF not yet ready — try to generate it now (await)
+    const consulRow = db.getConsultation(calculationId);
+    if (!consulRow) {
+      return res.status(404).json({ error: 'Consultation not ready yet. Try again in a few seconds.' });
+    }
+    const consultation = JSON.parse(consulRow.consultation_json);
+    const compat  = row.compatibility_json ? JSON.parse(row.compatibility_json) : {};
+    const pdfData = {
+      partner1:      { name: row.partner1_name, birthDate: row.partner1_birth, gender: row.partner1_gender },
+      partner2:      { name: row.partner2_name, birthDate: row.partner2_birth, gender: row.partner2_gender },
+      compatibility: compat,
+      consultation,
+    };
+    generatePremiumPDF(pdfData, calculationId).then(function () {
+      const download = String(req.query.download || '') === 'true';
+      const p1 = row.partner1_name ? row.partner1_name.replace(/\s+/g, '-') : 'report';
+      const p2 = row.partner2_name ? row.partner2_name.replace(/\s+/g, '-') : '';
+      const filename = 'Consulenza-' + p1 + (p2 ? '-' + p2 : '') + '.pdf';
+      if (download) {
+        res.setHeader('Content-Disposition', 'attachment; filename="' + filename + '"');
+      } else {
+        res.setHeader('Content-Disposition', 'inline; filename="' + filename + '"');
+      }
+      res.setHeader('Content-Type', 'application/pdf');
+      res.sendFile(pdfPath);
+    }).catch(function (err) {
+      console.error('[api/report] PDF generation error:', err.message);
+      res.status(500).json({ error: 'PDF generation failed: ' + err.message });
+    });
+    return;
+  }
+
+  const download = String(req.query.download || '') === 'true';
+  const p1 = row.partner1_name ? row.partner1_name.replace(/\s+/g, '-') : 'report';
+  const p2 = row.partner2_name ? row.partner2_name.replace(/\s+/g, '-') : '';
+  const filename = 'Consulenza-' + p1 + (p2 ? '-' + p2 : '') + '.pdf';
+  if (download) {
+    res.setHeader('Content-Disposition', 'attachment; filename="' + filename + '"');
+  } else {
+    res.setHeader('Content-Disposition', 'inline; filename="' + filename + '"');
+  }
+  res.setHeader('Content-Type', 'application/pdf');
+  res.sendFile(pdfPath);
 });
 
 // =====================================================
