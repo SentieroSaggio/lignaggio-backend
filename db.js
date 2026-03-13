@@ -1,0 +1,258 @@
+'use strict';
+
+/**
+ * db.js — SQLite persistence layer (better-sqlite3)
+ * Tables: sessions, consultations
+ * Database file: backend/database/quiz.db
+ */
+
+const path     = require('path');
+const fs       = require('fs');
+const crypto   = require('crypto');
+const Database = require('better-sqlite3');
+
+// ── Ensure database directory exists ────────────────────────────────────────
+const DB_DIR  = path.join(__dirname, 'database');
+if (!fs.existsSync(DB_DIR)) {
+  fs.mkdirSync(DB_DIR, { recursive: true });
+}
+
+const DB_PATH = path.join(DB_DIR, 'quiz.db');
+
+// Open (or create) the database
+const db = new Database(DB_PATH);
+
+// WAL mode for better concurrent read performance
+db.pragma('journal_mode = WAL');
+db.pragma('foreign_keys = ON');
+
+// ── Schema ───────────────────────────────────────────────────────────────────
+db.exec(`
+  CREATE TABLE IF NOT EXISTS sessions (
+    id                TEXT PRIMARY KEY,
+    partner1_name     TEXT,
+    partner1_gender   TEXT,
+    partner1_birth    TEXT,
+    partner2_name     TEXT,
+    partner2_gender   TEXT,
+    partner2_birth    TEXT,
+    compatibility_json TEXT,
+    preview_json      TEXT,
+    payment_status    TEXT DEFAULT 'pending',
+    access_token      TEXT,
+    created_at        INTEGER
+  );
+
+  CREATE TABLE IF NOT EXISTS consultations (
+    id                TEXT PRIMARY KEY,
+    calculation_id    TEXT,
+    consultation_json TEXT,
+    image_url         TEXT,
+    pdf_url           TEXT,
+    created_at        INTEGER
+  );
+
+  CREATE TABLE IF NOT EXISTS session_emails (
+    calculation_id    TEXT PRIMARY KEY,
+    email             TEXT NOT NULL,
+    thank_you_sent    INTEGER DEFAULT 0,
+    abandoned_sent    INTEGER DEFAULT 0,
+    created_at        INTEGER
+  );
+`);
+
+// ── Migrations for existing databases ────────────────────────────────────────
+try { db.exec('ALTER TABLE session_emails ADD COLUMN thank_you_sent INTEGER DEFAULT 0'); } catch (_) {}
+try { db.exec('ALTER TABLE session_emails ADD COLUMN abandoned_sent INTEGER DEFAULT 0'); } catch (_) {}
+
+
+console.log('[db] SQLite database ready at', DB_PATH);
+
+// ── Prepared statements ──────────────────────────────────────────────────────
+const stmtInsertSession = db.prepare(`
+  INSERT OR IGNORE INTO sessions
+    (id, partner1_name, partner1_gender, partner1_birth,
+     partner2_name, partner2_gender, partner2_birth,
+     compatibility_json, preview_json, payment_status, access_token, created_at)
+  VALUES
+    (@id, @partner1_name, @partner1_gender, @partner1_birth,
+     @partner2_name, @partner2_gender, @partner2_birth,
+     @compatibility_json, @preview_json, @payment_status, @access_token, @created_at)
+`);
+
+const stmtUpdatePreview = db.prepare(`
+  UPDATE sessions SET preview_json = @preview_json WHERE id = @id
+`);
+
+const stmtMarkPaid = db.prepare(`
+  UPDATE sessions SET payment_status = 'paid', access_token = @access_token WHERE id = @id
+`);
+
+const stmtGetSession = db.prepare(`
+  SELECT * FROM sessions WHERE id = ?
+`);
+
+const stmtInsertConsultation = db.prepare(`
+  INSERT OR REPLACE INTO consultations
+    (id, calculation_id, consultation_json, image_url, pdf_url, created_at)
+  VALUES
+    (@id, @calculation_id, @consultation_json, @image_url, @pdf_url, @created_at)
+`);
+
+const stmtGetConsultation = db.prepare(`
+  SELECT * FROM consultations WHERE calculation_id = ?
+`);
+
+const stmtSaveSessionEmail = db.prepare(`
+  INSERT OR IGNORE INTO session_emails (calculation_id, email, created_at)
+  VALUES (@calculation_id, @email, @created_at)
+`);
+
+const stmtGetSessionEmail = db.prepare(`
+  SELECT * FROM session_emails WHERE calculation_id = ?
+`);
+
+const stmtMarkThankYouSent = db.prepare(`
+  UPDATE session_emails SET thank_you_sent = 1 WHERE calculation_id = ?
+`);
+
+const stmtMarkAbandonedSent = db.prepare(`
+  UPDATE session_emails SET abandoned_sent = 1 WHERE calculation_id = ?
+`);
+
+const stmtGetAbandonedCandidates = db.prepare(`
+  SELECT se.calculation_id, se.email, s.partner1_name, s.partner2_name
+  FROM session_emails se
+  LEFT JOIN sessions s ON s.id = se.calculation_id
+  WHERE se.abandoned_sent = 0
+    AND (s.payment_status IS NULL OR s.payment_status != 'paid')
+    AND se.created_at < @cutoff
+`);
+
+// ── Public API ───────────────────────────────────────────────────────────────
+
+/**
+ * Insert a new session row (IGNORE if already exists — idempotent).
+ * @param {string} id  - calculation_id
+ * @param {object} partner1 - { name, gender, birthDate }
+ * @param {object} partner2 - { name, gender, birthDate }
+ * @param {object} compatibility - full compatibility object
+ */
+function insertSession(id, partner1, partner2, compatibility) {
+  stmtInsertSession.run({
+    id,
+    partner1_name:     (partner1 && partner1.name)      || null,
+    partner1_gender:   (partner1 && partner1.gender)    || null,
+    partner1_birth:    (partner1 && partner1.birthDate) || null,
+    partner2_name:     (partner2 && partner2.name)      || null,
+    partner2_gender:   (partner2 && partner2.gender)    || null,
+    partner2_birth:    (partner2 && partner2.birthDate) || null,
+    compatibility_json: compatibility ? JSON.stringify(compatibility) : null,
+    preview_json:      null,
+    payment_status:    'pending',
+    access_token:      null,
+    created_at:        Date.now(),
+  });
+}
+
+/**
+ * Save or update the preview JSON for a session.
+ */
+function updateSessionPreview(calculationId, previewObj) {
+  stmtUpdatePreview.run({
+    id:           calculationId,
+    preview_json: JSON.stringify(previewObj),
+  });
+}
+
+/**
+ * Mark a session as paid and store the access token.
+ */
+function markSessionPaid(calculationId, accessToken) {
+  stmtMarkPaid.run({ id: calculationId, access_token: accessToken });
+}
+
+/**
+ * Retrieve a session row by calculation_id.
+ * Returns null if not found.
+ */
+function getSession(calculationId) {
+  return stmtGetSession.get(calculationId) || null;
+}
+
+/**
+ * Save a consultation to the consultations table.
+ * Uses OR REPLACE so re-running is safe.
+ */
+function insertConsultation(calculationId, consultationObj, imageUrl, pdfUrl) {
+  stmtInsertConsultation.run({
+    id:                crypto.randomBytes(16).toString('hex'),
+    calculation_id:    calculationId,
+    consultation_json: JSON.stringify(consultationObj),
+    image_url:         imageUrl || null,
+    pdf_url:           pdfUrl   || null,
+    created_at:        Date.now(),
+  });
+}
+
+/**
+ * Retrieve the consultation for a given calculation_id.
+ * Returns null if not found.
+ */
+function getConsultation(calculationId) {
+  return stmtGetConsultation.get(calculationId) || null;
+}
+
+/**
+ * Save the user's email when they initiate payment (idempotent).
+ */
+function saveSessionEmail(calculationId, email) {
+  stmtSaveSessionEmail.run({
+    calculation_id: calculationId,
+    email:          email,
+    created_at:     Date.now(),
+  });
+}
+
+/**
+ * Get the email record for a calculation.
+ */
+function getSessionEmail(calculationId) {
+  return stmtGetSessionEmail.get(calculationId) || null;
+}
+
+/**
+ * Mark the thank-you / consultation email as sent.
+ */
+function markThankYouSent(calculationId) {
+  stmtMarkThankYouSent.run(calculationId);
+}
+
+/**
+ * Mark the abandoned-cart email as sent.
+ */
+function markAbandonedSent(calculationId) {
+  stmtMarkAbandonedSent.run(calculationId);
+}
+
+/**
+ * Return sessions that left an email but didn't pay, older than minAgeMs.
+ */
+function getAbandonedCandidates(minAgeMs) {
+  const cutoff = Date.now() - minAgeMs;
+  return stmtGetAbandonedCandidates.all({ cutoff });
+}
+
+module.exports = {
+  insertSession,
+  updateSessionPreview,
+  markSessionPaid,
+  getSession,
+  insertConsultation,
+  getConsultation,
+  saveSessionEmail,
+  getSessionEmail,
+  markThankYouSent,
+  markAbandonedSent,
+  getAbandonedCandidates,
+};
