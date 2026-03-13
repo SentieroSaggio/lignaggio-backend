@@ -638,7 +638,7 @@ function extractPreviewExcerpt(text, maxChars = 350) {
 // ── generatePreview — cheap 4-section preview, called BEFORE payment ──────────
 async function generatePreview(data) {
   const response = await openai.chat.completions.create({
-    model:           'gpt-4o-mini',
+    model:           'gpt-5-mini',
     response_format: { type: 'json_object' },
     temperature:     0.8,
     max_tokens:      600,
@@ -737,7 +737,7 @@ async function generateFullConsultation(calculationId) {
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
       const response = await openai.chat.completions.create({
-        model:           'gpt-4o',
+        model:           'gpt-5.1',
         response_format: { type: 'json_object' },
         temperature:     0.85,
         max_tokens:      8000,
