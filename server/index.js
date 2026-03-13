@@ -638,10 +638,10 @@ function extractPreviewExcerpt(text, maxChars = 350) {
 // ── generatePreview — cheap 4-section preview, called BEFORE payment ──────────
 async function generatePreview(data) {
   const response = await openai.chat.completions.create({
-    model:                 'gpt-4o-mini',
+    model:                 'gpt-5.4',
     response_format:       { type: 'json_object' },
-    temperature:           0.8,
-    max_completion_tokens: 6000,
+    temperature:           0.7,
+    max_completion_tokens: 800,
     messages: [
       { role: 'system', content: PREVIEW_SYSTEM_PROMPT },
       { role: 'user',   content: buildPreviewPrompt(data) },
@@ -737,10 +737,10 @@ async function generateFullConsultation(calculationId) {
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
       const response = await openai.chat.completions.create({
-        model:                 'gpt-4o',
+        model:                 'gpt-5.4',
         response_format:       { type: 'json_object' },
-        temperature:           0.85,
-        max_completion_tokens: 8000,
+        temperature:           0.7,
+        max_completion_tokens: 7000,
         messages: [
           { role: 'system', content: CONSULTATION_SYSTEM_PROMPT },
           { role: 'user',   content: buildConsultationPrompt(partnerData) },
