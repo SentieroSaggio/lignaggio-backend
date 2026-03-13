@@ -736,6 +736,64 @@ async function generateFullConsultation(calculationId) {
 
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
+      // ── Step 1: Generate structured outline ─────────────────────────
+      const _p1 = partnerData.partner1 || {};
+      const _p2 = partnerData.partner2 || {};
+      const _p1Name      = _p1.name      || 'Partner 1';
+      const _p2Name      = _p2.name      || 'Partner 2';
+      const _p1Birthdate = _p1.birthDate || 'sconosciuta';
+      const _p2Birthdate = _p2.birthDate || 'sconosciuta';
+
+      const outlineResponse = await openai.chat.completions.create({
+        model:                 'gpt-5.4',
+        temperature:           0.6,
+        max_completion_tokens: 900,
+        messages: [
+          {
+            role:    'system',
+            content: 'You are an expert in relationship psychology, astrology and the Matrix of Destiny compatibility system.',
+          },
+          {
+            role:    'user',
+            content: `Create a structured outline for a deep compatibility consultation.
+
+Partner 1:
+Name: ${_p1Name}
+Birth date: ${_p1Birthdate}
+
+Partner 2:
+Name: ${_p2Name}
+Birth date: ${_p2Birthdate}
+
+The outline must include analysis of:
+
+• personality archetypes
+• emotional patterns
+• relationship dynamics
+• karmic lessons
+• Matrix of Destiny compatibility
+• astrological compatibility
+• solar cycles and life stages
+• strengths of the relationship
+• possible conflicts
+• growth potential
+
+Return exactly 10 sections.
+
+For each section include:
+* title
+* main theme
+* key insights to explore
+
+Do NOT write the full consultation yet.`,
+          },
+        ],
+      });
+
+      const outline = outlineResponse.choices[0].message.content;
+      console.log('[generateFullConsultation] Outline generated for:', calculationId);
+
+      // ── Step 2: Generate full consultation using the outline ──────────
       const response = await openai.chat.completions.create({
         model:                 'gpt-5.4',
         response_format:       { type: 'json_object' },
@@ -743,7 +801,10 @@ async function generateFullConsultation(calculationId) {
         max_completion_tokens: 7000,
         messages: [
           { role: 'system', content: CONSULTATION_SYSTEM_PROMPT },
-          { role: 'user',   content: buildConsultationPrompt(partnerData) },
+          {
+            role:    'user',
+            content: buildConsultationPrompt(partnerData) + '\n\n═══ STRUTTURA GUIDA ═══\n\nUsa questa struttura come guida per approfondire ogni sezione. Mantieni il formato JSON richiesto con le 10 chiavi esatte.\n\n' + outline,
+          },
         ],
       });
 
