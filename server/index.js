@@ -71,7 +71,7 @@ app.use(
       'http://localhost:4242', // на будущее, для локальных тестов
     ],
     methods: ['GET', 'POST'],
-    allowedHeaders: ['Content-Type'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
   })
 );
 
@@ -1360,6 +1360,149 @@ app.get('/api/session/:calculationId', function (req, res) {
       paymentStatus: row.payment_status || 'pending',
     },
   });
+});
+
+// =====================================================
+// ADMIN ROUTES — Basic Auth
+// =====================================================
+function adminAuth(req, res, next) {
+  const authHeader = req.headers['authorization'] || '';
+  if (!authHeader.startsWith('Basic ')) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  try {
+    const decoded  = Buffer.from(authHeader.slice(6), 'base64').toString('utf8');
+    const colonIdx = decoded.indexOf(':');
+    if (colonIdx < 1) { throw new Error('bad format'); }
+    const email    = decoded.slice(0, colonIdx);
+    const password = decoded.slice(colonIdx + 1);
+    if (email === process.env.ADMIN_EMAIL && password === process.env.ADMIN_PASSWORD) {
+      return next();
+    }
+  } catch (_) {}
+  return res.status(401).json({ error: 'Unauthorized' });
+}
+
+app.get('/api/admin/sessions', adminAuth, function (req, res) {
+  try {
+    const sessions = db.getAllSessions();
+    res.json({ success: true, sessions });
+  } catch (err) {
+    console.error('[admin/sessions]', err.message);
+    res.status(500).json({ success: false, error: 'server_error' });
+  }
+});
+
+app.get('/api/admin/session/:id', adminAuth, function (req, res) {
+  try {
+    const id      = String(req.params.id || '').trim();
+    const session = db.getAdminSession(id);
+    if (!session) { return res.status(404).json({ success: false, error: 'Not found' }); }
+    res.json({ success: true, session });
+  } catch (err) {
+    console.error('[admin/session]', err.message);
+    res.status(500).json({ success: false, error: 'server_error' });
+  }
+});
+
+app.post('/api/admin/send-email', adminAuth, async function (req, res) {
+  const { calculation_id, type } = req.body || {};
+  if (!calculation_id || !type) {
+    return res.status(400).json({ success: false, error: 'Missing params' });
+  }
+  try {
+    const row = db.getSession(calculation_id);
+    if (!row) { return res.status(404).json({ success: false, error: 'Session not found' }); }
+
+    if (type === 'thank_you' || type === 'consultation') {
+      const consulRow = db.getConsultation(calculation_id);
+      if (!consulRow) { return res.status(400).json({ success: false, error: 'No consultation yet' }); }
+      const consultation = JSON.parse(consulRow.consultation_json);
+      const compat = row.compatibility_json ? JSON.parse(row.compatibility_json) : {};
+      // Force-send: temporarily clear thank_you_sent by calling the mailer directly
+      const emailRow = db.getSessionEmail(calculation_id);
+      if (!emailRow || !emailRow.email) { return res.status(400).json({ success: false, error: 'No email on record' }); }
+      const p1Name = row.partner1_name || 'Partner 1';
+      const p2Name = row.partner2_name || 'Partner 2';
+      const score  = compat.compatibilityScore != null ? compat.compatibilityScore + '%' : null;
+      const resultUrl = SITE_URL + '/quiz-test/result-unlocked.html?cid=' + encodeURIComponent(calculation_id);
+      const bodyHtml  = _buildConsultBody(consultation, p1Name, p2Name);
+      await sendEmail({
+        to:      emailRow.email,
+        subject: 'Quiz Test di Compatibilità dei Partner – La tua consulenza è pronta',
+        html: `<div style="font-family:sans-serif;max-width:640px;margin:auto;color:#222;line-height:1.6">
+          <div style="background:#6b21a8;padding:24px 32px;border-radius:8px 8px 0 0">
+            <h1 style="color:#fff;font-size:20px;margin:0">✦ La tua consulenza di compatibilità è pronta</h1>
+          </div>
+          <div style="background:#fff;padding:32px;border:1px solid #e5e7eb;border-top:0;border-radius:0 0 8px 8px">
+            <p>Ciao <strong>${escapeHtml(p1Name)}</strong>,</p>
+            <p>La consulenza completa per <strong>${escapeHtml(p1Name)}</strong> e <strong>${escapeHtml(p2Name)}</strong> è stata generata.${score ? ' Score di compatibilità: <strong>' + score + '</strong>.' : ''}</p>
+            <hr style="border:0;border-top:1px solid #e5e7eb;margin:24px 0">
+            ${bodyHtml}
+            <hr style="border:0;border-top:1px solid #e5e7eb;margin:24px 0">
+            <p style="text-align:center">
+              <a href="${resultUrl}" style="background:#6b21a8;color:#fff;padding:12px 28px;border-radius:6px;text-decoration:none;font-weight:600">Visualizza la consulenza online ✦</a>
+            </p>
+            <p style="margin-top:32px;font-size:12px;color:#999;text-align:center">© Quiz Test di Compatibilità dei Partner · lignaggio.it</p>
+          </div>
+        </div>`,
+      });
+    } else if (type === 'abandoned') {
+      const emailRow = db.getSessionEmail(calculation_id);
+      if (!emailRow || !emailRow.email) { return res.status(400).json({ success: false, error: 'No email on record' }); }
+      await sendAbandonedCartEmail(calculation_id, emailRow.email, row.partner1_name, row.partner2_name);
+    } else {
+      return res.status(400).json({ success: false, error: 'Unknown type' });
+    }
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[admin/send-email]', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post('/api/admin/send-consultation', adminAuth, async function (req, res) {
+  const { calculation_id } = req.body || {};
+  if (!calculation_id) { return res.status(400).json({ success: false, error: 'Missing calculation_id' }); }
+  try {
+    const row = db.getSession(calculation_id);
+    if (!row) { return res.status(404).json({ success: false, error: 'Session not found' }); }
+    const consulRow = db.getConsultation(calculation_id);
+    if (!consulRow) { return res.status(400).json({ success: false, error: 'No consultation' }); }
+    const consultation = JSON.parse(consulRow.consultation_json);
+    const compat = row.compatibility_json ? JSON.parse(row.compatibility_json) : {};
+    const emailRow = db.getSessionEmail(calculation_id);
+    if (!emailRow || !emailRow.email) { return res.status(400).json({ success: false, error: 'No email on record' }); }
+    const p1Name   = row.partner1_name || 'Partner 1';
+    const p2Name   = row.partner2_name || 'Partner 2';
+    const score    = compat.compatibilityScore != null ? compat.compatibilityScore + '%' : null;
+    const resultUrl = SITE_URL + '/quiz-test/result-unlocked.html?cid=' + encodeURIComponent(calculation_id);
+    const bodyHtml  = _buildConsultBody(consultation, p1Name, p2Name);
+    await sendEmail({
+      to:      emailRow.email,
+      subject: 'Quiz Test di Compatibilità dei Partner – La tua consulenza è pronta',
+      html: `<div style="font-family:sans-serif;max-width:640px;margin:auto;color:#222;line-height:1.6">
+        <div style="background:#6b21a8;padding:24px 32px;border-radius:8px 8px 0 0">
+          <h1 style="color:#fff;font-size:20px;margin:0">✦ La tua consulenza di compatibilità è pronta</h1>
+        </div>
+        <div style="background:#fff;padding:32px;border:1px solid #e5e7eb;border-top:0;border-radius:0 0 8px 8px">
+          <p>Ciao <strong>${escapeHtml(p1Name)}</strong>,</p>
+          <p>La consulenza completa per <strong>${escapeHtml(p1Name)}</strong> e <strong>${escapeHtml(p2Name)}</strong> è stata generata.${score ? ' Score di compatibilità: <strong>' + score + '</strong>.' : ''}</p>
+          <hr style="border:0;border-top:1px solid #e5e7eb;margin:24px 0">
+          ${bodyHtml}
+          <hr style="border:0;border-top:1px solid #e5e7eb;margin:24px 0">
+          <p style="text-align:center">
+            <a href="${resultUrl}" style="background:#6b21a8;color:#fff;padding:12px 28px;border-radius:6px;text-decoration:none;font-weight:600">Visualizza la consulenza online ✦</a>
+          </p>
+          <p style="margin-top:32px;font-size:12px;color:#999;text-align:center">© Quiz Test di Compatibilità dei Partner · lignaggio.it</p>
+        </div>
+      </div>`,
+    });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[admin/send-consultation]', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
 });
 
 // =====================================================

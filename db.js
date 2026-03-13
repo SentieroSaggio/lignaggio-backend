@@ -243,6 +243,78 @@ function getAbandonedCandidates(minAgeMs) {
   return stmtGetAbandonedCandidates.all({ cutoff });
 }
 
+// ── Admin queries ────────────────────────────────────────────────────────────
+const stmtGetAllSessions = db.prepare(`
+  SELECT
+    s.id,
+    s.partner1_name, s.partner1_birth,
+    s.partner2_name, s.partner2_birth,
+    s.payment_status,
+    s.compatibility_json,
+    s.created_at,
+    se.email,
+    CASE WHEN c.id IS NOT NULL THEN 1 ELSE 0 END AS consultation_ready
+  FROM sessions s
+  LEFT JOIN session_emails se ON se.calculation_id = s.id
+  LEFT JOIN consultations c  ON c.calculation_id  = s.id
+  ORDER BY s.created_at DESC
+`);
+
+const stmtGetAdminSession = db.prepare(`
+  SELECT
+    s.*,
+    se.email,
+    c.consultation_json,
+    CASE WHEN c.id IS NOT NULL THEN 1 ELSE 0 END AS consultation_ready
+  FROM sessions s
+  LEFT JOIN session_emails se ON se.calculation_id = s.id
+  LEFT JOIN consultations c  ON c.calculation_id  = s.id
+  WHERE s.id = ?
+`);
+
+function getAllSessions() {
+  const rows = stmtGetAllSessions.all();
+  return rows.map(function (r) {
+    const compat = r.compatibility_json ? JSON.parse(r.compatibility_json) : {};
+    return {
+      id:                  r.id,
+      email:               r.email || null,
+      partner1_name:       r.partner1_name  || null,
+      partner1_birth:      r.partner1_birth || null,
+      partner2_name:       r.partner2_name  || null,
+      partner2_birth:      r.partner2_birth || null,
+      payment_status:      r.payment_status || 'pending',
+      compatibility_score: compat.compatibilityScore != null ? compat.compatibilityScore : null,
+      created_at:          r.created_at,
+      consultation_ready:  Boolean(r.consultation_ready),
+    };
+  });
+}
+
+function getAdminSession(id) {
+  const r = stmtGetAdminSession.get(id);
+  if (!r) { return null; }
+  const compat = r.compatibility_json   ? JSON.parse(r.compatibility_json)   : {};
+  const preview = r.preview_json        ? JSON.parse(r.preview_json)         : null;
+  const consult = r.consultation_json   ? JSON.parse(r.consultation_json)    : null;
+  return {
+    id:             r.id,
+    email:          r.email           || null,
+    partner1_name:  r.partner1_name   || null,
+    partner1_birth: r.partner1_birth  || null,
+    partner1_gender:r.partner1_gender || null,
+    partner2_name:  r.partner2_name   || null,
+    partner2_birth: r.partner2_birth  || null,
+    partner2_gender:r.partner2_gender || null,
+    payment_status: r.payment_status  || 'pending',
+    compatibility:  compat,
+    preview:        preview,
+    consultation:   consult,
+    consultation_ready: Boolean(r.consultation_ready),
+    created_at:     r.created_at,
+  };
+}
+
 module.exports = {
   insertSession,
   updateSessionPreview,
@@ -255,4 +327,6 @@ module.exports = {
   markThankYouSent,
   markAbandonedSent,
   getAbandonedCandidates,
+  getAllSessions,
+  getAdminSession,
 };
