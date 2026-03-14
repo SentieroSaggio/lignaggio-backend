@@ -7,13 +7,14 @@
     "dev": "node server/index.js"
   },
   "dependencies": {
+    "@sparticuz/chromium": "^133.0.0",
     "better-sqlite3": "^12.6.2",
     "cors": "^2.8.5",
     "dotenv": "^16.6.1",
     "express": "^4.19.2",
     "nodemailer": "^8.0.2",
     "openai": "^4.0.0",
-    "puppeteer": "^24.39.1",
+    "puppeteer-core": "^24.39.1",
     "stripe": "^14.22.0"
   }
 }

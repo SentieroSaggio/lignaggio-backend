@@ -11,7 +11,8 @@
 
 const path       = require('path');
 const fs         = require('fs');
-const puppeteer  = require('puppeteer');
+const puppeteer  = require('puppeteer-core');
+const chromium   = require('@sparticuz/chromium');
 
 // Paths
 const TEMPLATE_PATH  = path.join(__dirname, '..', 'templates', 'premium-report.html');
@@ -217,9 +218,12 @@ async function generatePremiumPDF(data, calculationId) {
   // ── Puppeteer ──────────────────────────────────────────────────────────────
   let browser;
   try {
+    const executablePath = await chromium.executablePath();
     browser = await puppeteer.launch({
-      headless: 'new',
+      headless: chromium.headless,
+      executablePath,
       args: [
+        ...chromium.args,
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
