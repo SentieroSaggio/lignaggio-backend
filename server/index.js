@@ -1297,18 +1297,22 @@ function _createTransporter() {
   });
 }
 
-async function sendEmail({ to, subject, html }) {
+async function sendEmail({ to, subject, html, attachments }) {
   if (!process.env.SMTP_USER || !process.env.SMTP_PASS) {
     console.warn('[email] SMTP_USER/SMTP_PASS not configured — email not sent to', to);
     return;
   }
   const transporter = _createTransporter();
-  await transporter.sendMail({
+  const mailOptions = {
     from:    '"Quiz Test di Compatibilità dei Partner" <' + process.env.SMTP_USER + '>',
     to,
     subject,
     html,
-  });
+  };
+  if (Array.isArray(attachments) && attachments.length > 0) {
+    mailOptions.attachments = attachments;
+  }
+  await transporter.sendMail(mailOptions);
   console.log('[email] Sent to', to, '—', subject);
 }
 
@@ -1606,6 +1610,39 @@ app.post('/api/admin/send-email', adminAuth, async function (req, res) {
       const emailRow = db.getSessionEmail(calculation_id);
       if (!emailRow || !emailRow.email) { return res.status(400).json({ success: false, error: 'No email on record' }); }
       await sendAbandonedCartEmail(calculation_id, emailRow.email, row.partner1_name, row.partner2_name);
+    } else if (type === 'custom') {
+      // Admin-composed custom email with optional PDF attachment
+      const { to, subject, message, attach_pdf } = req.body;
+      if (!to || !subject) { return res.status(400).json({ success: false, error: 'Missing to/subject' }); }
+      let attachments = [];
+      if (attach_pdf) {
+        const consulRow = db.getConsultation(calculation_id);
+        if (!consulRow) { return res.status(400).json({ success: false, error: 'No consultation — PDF cannot be generated' }); }
+        const consultation = JSON.parse(consulRow.consultation_json);
+        const compat       = row.compatibility_json ? JSON.parse(row.compatibility_json) : {};
+        const p1Name       = row.partner1_name || 'Partner 1';
+        const p2Name       = row.partner2_name || 'Partner 2';
+        const { generatePDF } = require('../services/pdfGenerator');
+        const pdfBuffer = await generatePDF({ calculationId: calculation_id, consultation, compatibility: compat, partner1Name: p1Name, partner2Name: p2Name });
+        attachments = [{ filename: 'consulenza-compatibilita.pdf', content: pdfBuffer, contentType: 'application/pdf' }];
+      }
+      const bodyText = message
+        ? message.replace(/\n/g, '<br>')
+        : 'Messaggio dall\'amministratore del Quiz Test di Compatibilità dei Partner.';
+      await sendEmail({
+        to,
+        subject,
+        html: `<div style="font-family:sans-serif;max-width:640px;margin:auto;color:#222;line-height:1.6">
+          <div style="background:#6b21a8;padding:24px 32px;border-radius:8px 8px 0 0">
+            <h1 style="color:#fff;font-size:18px;margin:0">✦ Quiz Test di Compatibilità dei Partner</h1>
+          </div>
+          <div style="background:#fff;padding:32px;border:1px solid #e5e7eb;border-top:0;border-radius:0 0 8px 8px">
+            <p>${bodyText}</p>
+            <p style="margin-top:32px;font-size:12px;color:#999;text-align:center">© Quiz Test di Compatibilità dei Partner · lignaggio.it</p>
+          </div>
+        </div>`,
+        attachments,
+      });
     } else {
       return res.status(400).json({ success: false, error: 'Unknown type' });
     }
@@ -1657,6 +1694,53 @@ app.post('/api/admin/send-consultation', adminAuth, async function (req, res) {
   } catch (err) {
     console.error('[admin/send-consultation]', err.message);
     res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── Analytics stats routes ─────────────────────────────────────────────────
+app.get('/api/admin/stats/overview', adminAuth, function (req, res) {
+  try {
+    const data = db.getStatsOverview();
+    res.json(data);
+  } catch (err) {
+    console.error('[admin/stats/overview]', err.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+app.get('/api/admin/stats/funnel', adminAuth, function (req, res) {
+  try {
+    const data = db.getStatsFunnel();
+    res.json(data);
+  } catch (err) {
+    console.error('[admin/stats/funnel]', err.message);
+    res.status(500).json({ stages: [] });
+  }
+});
+
+app.get('/api/admin/stats/pages', adminAuth, function (req, res) {
+  // No page-view tracking table — return derived data from sessions
+  try {
+    const overview = db.getStatsOverview();
+    const pages = [
+      { page: 'quiz-test/',                   views: overview.visitors.total, unique: overview.visitors.total, dropoff: 0 },
+      { page: 'quiz-test/offer.html',          views: overview.preview.total,  unique: overview.preview.total,  dropoff: overview.visitors.total > 0 ? Math.round((1 - overview.preview.total / overview.visitors.total) * 100) : 0 },
+      { page: 'quiz-test/result-unlocked.html', views: overview.payments.total, unique: overview.payments.total, dropoff: overview.preview.total  > 0 ? Math.round((1 - overview.payments.total / overview.preview.total) * 100) : 0 },
+    ];
+    res.json({ pages });
+  } catch (err) {
+    console.error('[admin/stats/pages]', err.message);
+    res.status(500).json({ pages: [] });
+  }
+});
+
+app.get('/api/admin/stats/realtime', adminAuth, function (req, res) {
+  try {
+    const data = db.getStatsRealtime();
+    res.json(data);
+  } catch (err) {
+    console.error('[admin/stats/realtime]', err.message);
+    res.status(500).json({ active: 0 });
   }
 });
 

@@ -315,6 +315,97 @@ function getAdminSession(id) {
   };
 }
 
+// ── Analytics stats ──────────────────────────────────────────────────────────
+
+function getStatsOverview() {
+  const now      = Date.now();
+  const dayStart = now - (now % 86400000);          // midnight UTC today
+  const weekAgo  = now - 7  * 86400000;
+  const monthAgo = now - 30 * 86400000;
+
+  // Counts from sessions
+  const counts = db.prepare(`
+    SELECT
+      COUNT(*) AS total,
+      SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END) AS today,
+      SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END) AS week,
+      SUM(CASE WHEN payment_status = 'paid' THEN 1 ELSE 0 END) AS paid_total,
+      SUM(CASE WHEN payment_status = 'paid' AND created_at >= ? THEN 1 ELSE 0 END) AS paid_today,
+      SUM(CASE WHEN payment_status = 'paid' AND created_at >= ? THEN 1 ELSE 0 END) AS paid_week,
+      SUM(CASE WHEN payment_status = 'paid' AND created_at >= ? THEN 1 ELSE 0 END) AS paid_month
+    FROM sessions
+  `).get(dayStart, weekAgo, dayStart, weekAgo, monthAgo);
+
+  // Preview/offer views (emails collected = user reached checkout)
+  const previews = db.prepare(`
+    SELECT
+      COUNT(*) AS total,
+      SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END) AS today,
+      SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END) AS week
+    FROM session_emails
+  `).get(dayStart, weekAgo);
+
+  // Hourly buckets for last 24 h (visits = session creates)
+  const hourly = db.prepare(`
+    SELECT (created_at / 3600000) * 3600000 AS hour_bucket, COUNT(*) AS c
+    FROM sessions
+    WHERE created_at >= ?
+    GROUP BY hour_bucket
+    ORDER BY hour_bucket
+  `).all(now - 86400000);
+
+  // Daily buckets for last 7 days
+  const weekly = db.prepare(`
+    SELECT (created_at / 86400000) * 86400000 AS day_bucket, COUNT(*) AS c
+    FROM sessions
+    WHERE created_at >= ?
+    GROUP BY day_bucket
+    ORDER BY day_bucket
+  `).all(weekAgo);
+
+  const crToday = counts.today > 0 ? ((counts.paid_today / counts.today) * 100).toFixed(1) : '0.0';
+  const crWeek  = counts.week  > 0 ? ((counts.paid_week  / counts.week)  * 100).toFixed(1) : '0.0';
+
+  return {
+    visitors:   { today: counts.today,      week: counts.week,      total: counts.total },
+    payments:   { today: counts.paid_today, week: counts.paid_week, month: counts.paid_month, total: counts.paid_total },
+    conversion: { today: crToday, week: crWeek },
+    preview:    { today: previews.today, week: previews.week, total: previews.total },
+    hourly,
+    weekly,
+  };
+}
+
+function getStatsFunnel() {
+  const row = db.prepare(`
+    SELECT
+      COUNT(DISTINCT s.id) AS started,
+      COUNT(DISTINCT se.calculation_id) AS emailed,
+      COUNT(DISTINCT CASE WHEN s.payment_status = 'paid' THEN s.id END) AS paid,
+      COUNT(DISTINCT c.calculation_id) AS consulted
+    FROM sessions s
+    LEFT JOIN session_emails se ON se.calculation_id = s.id
+    LEFT JOIN consultations  c  ON c.calculation_id  = s.id
+  `).get();
+
+  return {
+    stages: [
+      { name: 'Quiz avviato',           value: row.started   || 0 },
+      { name: 'Email inserita',         value: row.emailed   || 0 },
+      { name: 'Pagamento completato',   value: row.paid      || 0 },
+      { name: 'Consulenza generata',    value: row.consulted || 0 },
+    ],
+  };
+}
+
+function getStatsRealtime() {
+  const cutoff = Date.now() - 5 * 60 * 1000;   // last 5 minutes
+  const row = db.prepare(`
+    SELECT COUNT(*) AS active FROM sessions WHERE created_at >= ?
+  `).get(cutoff);
+  return { active: row.active || 0 };
+}
+
 module.exports = {
   insertSession,
   updateSessionPreview,
@@ -329,4 +420,7 @@ module.exports = {
   getAbandonedCandidates,
   getAllSessions,
   getAdminSession,
+  getStatsOverview,
+  getStatsFunnel,
+  getStatsRealtime,
 };
