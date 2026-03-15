@@ -73,7 +73,7 @@ app.use(
       'https://www.lignaggio.it',
       'http://localhost:4242', // на будущее, для локальных тестов
     ],
-    methods: ['GET', 'POST'],
+    methods: ['GET', 'POST', 'DELETE'],
     allowedHeaders: ['Content-Type', 'Authorization'],
   })
 );
@@ -120,9 +120,10 @@ app.post(
 
         // ── New compatibility quiz: mark result as paid, persist to DB ──────────
         const calculationId = metadata.calculation_id;
+        const selectedPrice  = metadata.selected_price || metadata.price || null;
         if (calculationId) {
           console.log('[webhook] payment_intent.succeeded — calculation_id:', calculationId);
-          markResultAsPaid(calculationId);
+          markResultAsPaid(calculationId, selectedPrice);
           // Fire-and-forget: generate full consultation asynchronously after payment.
           // Do NOT await — webhook must respond to Stripe quickly (< 30 s).
           generateFullConsultation(calculationId).catch(function (err) {
@@ -1493,12 +1494,11 @@ app.get('/api/report/:calculation_id', function (req, res) {
       const download = String(req.query.download || '') === 'true';
       const p1 = row.partner1_name ? row.partner1_name.replace(/\s+/g, '-') : 'report';
       const p2 = row.partner2_name ? row.partner2_name.replace(/\s+/g, '-') : '';
-      const filename = 'Consulenza-' + p1 + (p2 ? '-' + p2 : '') + '.pdf';
-      if (download) {
-        res.setHeader('Content-Disposition', 'attachment; filename="' + filename + '"');
-      } else {
-        res.setHeader('Content-Disposition', 'inline; filename="' + filename + '"');
-      }
+      const rawFilename = 'Consulenza-' + p1 + (p2 ? '-' + p2 : '') + '.pdf';
+      const asciiFilename = rawFilename.replace(/[^\x20-\x7E]/g, '').replace(/\s+/g, '-') || 'Consulenza-report.pdf';
+      const encodedFilename = encodeURIComponent(rawFilename);
+      const disposition = download ? 'attachment' : 'inline';
+      res.setHeader('Content-Disposition', disposition + '; filename="' + asciiFilename + '"; filename*=UTF-8\'\'' + encodedFilename);
       res.setHeader('Content-Type', 'application/pdf');
       res.sendFile(pdfPath);
     }).catch(function (err) {
@@ -1511,12 +1511,11 @@ app.get('/api/report/:calculation_id', function (req, res) {
   const download = String(req.query.download || '') === 'true';
   const p1 = row.partner1_name ? row.partner1_name.replace(/\s+/g, '-') : 'report';
   const p2 = row.partner2_name ? row.partner2_name.replace(/\s+/g, '-') : '';
-  const filename = 'Consulenza-' + p1 + (p2 ? '-' + p2 : '') + '.pdf';
-  if (download) {
-    res.setHeader('Content-Disposition', 'attachment; filename="' + filename + '"');
-  } else {
-    res.setHeader('Content-Disposition', 'inline; filename="' + filename + '"');
-  }
+  const rawFilename = 'Consulenza-' + p1 + (p2 ? '-' + p2 : '') + '.pdf';
+  const asciiFilename = rawFilename.replace(/[^\x20-\x7E]/g, '').replace(/\s+/g, '-') || 'Consulenza-report.pdf';
+  const encodedFilename = encodeURIComponent(rawFilename);
+  const disposition = download ? 'attachment' : 'inline';
+  res.setHeader('Content-Disposition', disposition + '; filename="' + asciiFilename + '"; filename*=UTF-8\'\'' + encodedFilename);
   res.setHeader('Content-Type', 'application/pdf');
   res.sendFile(pdfPath);
 });
@@ -1697,6 +1696,34 @@ app.post('/api/admin/send-consultation', adminAuth, async function (req, res) {
   }
 });
 
+// ── Delete a single session ────────────────────────────────────────────────
+app.delete('/api/admin/session/:id', adminAuth, function (req, res) {
+  const id = String(req.params.id || '').trim();
+  if (!id) { return res.status(400).json({ success: false, error: 'Missing id' }); }
+  try {
+    db.deleteSession(id);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[admin/delete-session]', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── Bulk-delete sessions ───────────────────────────────────────────────────
+app.post('/api/admin/sessions/delete', adminAuth, function (req, res) {
+  const ids = req.body && Array.isArray(req.body.ids) ? req.body.ids : [];
+  if (!ids.length) { return res.status(400).json({ success: false, error: 'No ids provided' }); }
+  const errors = [];
+  ids.forEach(function (id) {
+    try { db.deleteSession(String(id).trim()); }
+    catch (err) { errors.push(id + ': ' + err.message); }
+  });
+  if (errors.length) {
+    return res.status(500).json({ success: false, error: errors.join('; ') });
+  }
+  res.json({ success: true, deleted: ids.length });
+});
+
 // ── Analytics stats routes ─────────────────────────────────────────────────
 app.get('/api/admin/stats/overview', adminAuth, function (req, res) {
   try {
@@ -1719,13 +1746,21 @@ app.get('/api/admin/stats/funnel', adminAuth, function (req, res) {
 });
 
 app.get('/api/admin/stats/pages', adminAuth, function (req, res) {
-  // No page-view tracking table — return derived data from sessions
+  // Derive full quiz funnel pages from session data
   try {
     const overview = db.getStatsOverview();
+    const quiz   = overview.visitors.total  || 0;
+    const email  = overview.preview.total   || 0;
+    const paid   = overview.payments.total  || 0;
+    const consult = db.getStatsFunnel().stages.find(function(s){ return s.name === 'Consulenza generata'; });
+    const consulted = (consult && consult.value) || 0;
+
+    // Drop-off from previous step
     const pages = [
-      { page: 'quiz-test/',                   views: overview.visitors.total, unique: overview.visitors.total, dropoff: 0 },
-      { page: 'quiz-test/offer.html',          views: overview.preview.total,  unique: overview.preview.total,  dropoff: overview.visitors.total > 0 ? Math.round((1 - overview.preview.total / overview.visitors.total) * 100) : 0 },
-      { page: 'quiz-test/result-unlocked.html', views: overview.payments.total, unique: overview.payments.total, dropoff: overview.preview.total  > 0 ? Math.round((1 - overview.payments.total / overview.preview.total) * 100) : 0 },
+      { page: 'quiz-test/',                    label: 'Start — index.html',           views: quiz,     unique: quiz,     dropoff: 0 },
+      { page: 'quiz-test/offer.html',           label: 'Offer page (email captured)',   views: email,    unique: email,    dropoff: quiz   > 0 ? Math.round((1 - email    / quiz)   * 100) : 0 },
+      { page: 'quiz-test/result-unlocked.html', label: 'Result unlocked (paid)',        views: paid,     unique: paid,     dropoff: email  > 0 ? Math.round((1 - paid     / email)  * 100) : 0 },
+      { page: 'quiz-test/consultation',         label: 'Consulenza generata',           views: consulted,unique: consulted,dropoff: paid   > 0 ? Math.round((1 - consulted/ paid)   * 100) : 0 },
     ];
     res.json({ pages });
   } catch (err) {
@@ -1741,6 +1776,16 @@ app.get('/api/admin/stats/realtime', adminAuth, function (req, res) {
   } catch (err) {
     console.error('[admin/stats/realtime]', err.message);
     res.status(500).json({ active: 0 });
+  }
+});
+
+app.get('/api/admin/stats/revenue-breakdown', adminAuth, function (req, res) {
+  try {
+    const data = db.getStatsRevenueBreakdown();
+    res.json(data);
+  } catch (err) {
+    console.error('[admin/stats/revenue-breakdown]', err.message);
+    res.status(500).json({ breakdown: [] });
   }
 });
 

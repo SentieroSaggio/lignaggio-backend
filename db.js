@@ -64,6 +64,14 @@ db.exec(`
 // ── Migrations for existing databases ────────────────────────────────────────
 try { db.exec('ALTER TABLE session_emails ADD COLUMN thank_you_sent INTEGER DEFAULT 0'); } catch (_) {}
 try { db.exec('ALTER TABLE session_emails ADD COLUMN abandoned_sent INTEGER DEFAULT 0'); } catch (_) {}
+try { db.exec('ALTER TABLE sessions ADD COLUMN selected_price TEXT'); } catch (_) {}
+// Normalize timestamps stored as Unix seconds → milliseconds
+// Any value < 10 billion is seconds-based (covers all dates up to ~2286 in seconds)
+try {
+  db.exec('UPDATE sessions       SET created_at = created_at * 1000 WHERE created_at IS NOT NULL AND created_at < 10000000000');
+  db.exec('UPDATE session_emails SET created_at = created_at * 1000 WHERE created_at IS NOT NULL AND created_at < 10000000000');
+  db.exec('UPDATE consultations  SET created_at = created_at * 1000 WHERE created_at IS NOT NULL AND created_at < 10000000000');
+} catch (e) { console.warn('[db] timestamp normalize error:', e.message); }
 
 
 console.log('[db] SQLite database ready at', DB_PATH);
@@ -85,7 +93,8 @@ const stmtUpdatePreview = db.prepare(`
 `);
 
 const stmtMarkPaid = db.prepare(`
-  UPDATE sessions SET payment_status = 'paid', access_token = @access_token WHERE id = @id
+  UPDATE sessions SET payment_status = 'paid', access_token = @access_token,
+    selected_price = COALESCE(@selected_price, selected_price) WHERE id = @id
 `);
 
 const stmtGetSession = db.prepare(`
@@ -166,10 +175,10 @@ function updateSessionPreview(calculationId, previewObj) {
 }
 
 /**
- * Mark a session as paid and store the access token.
+ * Mark a session as paid and store the access token and selected price.
  */
-function markSessionPaid(calculationId, accessToken) {
-  stmtMarkPaid.run({ id: calculationId, access_token: accessToken });
+function markSessionPaid(calculationId, accessToken, selectedPrice) {
+  stmtMarkPaid.run({ id: calculationId, access_token: accessToken, selected_price: selectedPrice || null });
 }
 
 /**
@@ -323,7 +332,7 @@ function getStatsOverview() {
   const weekAgo  = now - 7  * 86400000;
   const monthAgo = now - 30 * 86400000;
 
-  // Counts from sessions
+  // Counts from sessions including real revenue from selected_price
   const counts = db.prepare(`
     SELECT
       COUNT(*) AS total,
@@ -332,9 +341,14 @@ function getStatsOverview() {
       SUM(CASE WHEN payment_status = 'paid' THEN 1 ELSE 0 END) AS paid_total,
       SUM(CASE WHEN payment_status = 'paid' AND created_at >= ? THEN 1 ELSE 0 END) AS paid_today,
       SUM(CASE WHEN payment_status = 'paid' AND created_at >= ? THEN 1 ELSE 0 END) AS paid_week,
-      SUM(CASE WHEN payment_status = 'paid' AND created_at >= ? THEN 1 ELSE 0 END) AS paid_month
+      SUM(CASE WHEN payment_status = 'paid' AND created_at >= ? THEN 1 ELSE 0 END) AS paid_month,
+      COALESCE(SUM(CASE WHEN payment_status = 'paid' AND selected_price IS NOT NULL AND created_at >= ? THEN CAST(selected_price AS REAL) ELSE 0 END), 0) AS rev_today,
+      COALESCE(SUM(CASE WHEN payment_status = 'paid' AND selected_price IS NOT NULL AND created_at >= ? THEN CAST(selected_price AS REAL) ELSE 0 END), 0) AS rev_week,
+      COALESCE(SUM(CASE WHEN payment_status = 'paid' AND selected_price IS NOT NULL AND created_at >= ? THEN CAST(selected_price AS REAL) ELSE 0 END), 0) AS rev_month,
+      COALESCE(SUM(CASE WHEN payment_status = 'paid' AND selected_price IS NOT NULL THEN CAST(selected_price AS REAL) ELSE 0 END), 0) AS rev_total,
+      COALESCE(AVG(CASE WHEN json_valid(compatibility_json) THEN CAST(json_extract(compatibility_json, '$.compatibilityScore') AS REAL) END), 0) AS avg_score
     FROM sessions
-  `).get(dayStart, weekAgo, dayStart, weekAgo, monthAgo);
+  `).get(dayStart, weekAgo, dayStart, weekAgo, monthAgo, dayStart, weekAgo, monthAgo);
 
   // Preview/offer views (emails collected = user reached checkout)
   const previews = db.prepare(`
@@ -344,6 +358,19 @@ function getStatsOverview() {
       SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END) AS week
     FROM session_emails
   `).get(dayStart, weekAgo);
+
+  // 7-day funnel timeline (per day)
+  const funnelTimeline = db.prepare(`
+    SELECT
+      (s.created_at / 86400000) * 86400000 AS day_bucket,
+      COUNT(DISTINCT s.id) AS started,
+      COUNT(DISTINCT se.calculation_id) AS emailed,
+      COUNT(DISTINCT CASE WHEN s.payment_status = 'paid' THEN s.id END) AS paid
+    FROM sessions s
+    LEFT JOIN session_emails se ON se.calculation_id = s.id
+    WHERE s.created_at >= ?
+    GROUP BY day_bucket ORDER BY day_bucket
+  `).all(weekAgo);
 
   // Hourly buckets for last 24 h (visits = session creates)
   const hourly = db.prepare(`
@@ -363,16 +390,23 @@ function getStatsOverview() {
     ORDER BY day_bucket
   `).all(weekAgo);
 
-  const crToday = counts.today > 0 ? ((counts.paid_today / counts.today) * 100).toFixed(1) : '0.0';
-  const crWeek  = counts.week  > 0 ? ((counts.paid_week  / counts.week)  * 100).toFixed(1) : '0.0';
+  const crToday        = counts.today    > 0 ? ((counts.paid_today  / counts.today)    * 100).toFixed(1) : '0.0';
+  const crWeek         = counts.week     > 0 ? ((counts.paid_week   / counts.week)     * 100).toFixed(1) : '0.0';
+  const emailCapture   = counts.total    > 0 ? ((previews.total     / counts.total)    * 100).toFixed(1) : '0.0';
+  const aov            = counts.paid_total > 0 ? (counts.rev_total / counts.paid_total).toFixed(2) : '0.00';
 
   return {
-    visitors:   { today: counts.today,      week: counts.week,      total: counts.total },
-    payments:   { today: counts.paid_today, week: counts.paid_week, month: counts.paid_month, total: counts.paid_total },
-    conversion: { today: crToday, week: crWeek },
-    preview:    { today: previews.today, week: previews.week, total: previews.total },
+    visitors:         { today: counts.today,      week: counts.week,      total: counts.total },
+    payments:         { today: counts.paid_today, week: counts.paid_week, month: counts.paid_month, total: counts.paid_total },
+    conversion:       { today: crToday, week: crWeek },
+    preview:          { today: previews.today, week: previews.week, total: previews.total },
+    revenue:          { today: counts.rev_today, week: counts.rev_week, month: counts.rev_month, total: counts.rev_total },
+    avg_score:        Math.round(counts.avg_score || 0),
+    email_capture_rate: parseFloat(emailCapture),
+    aov:              parseFloat(aov),
     hourly,
     weekly,
+    funnel_timeline:  funnelTimeline,
   };
 }
 
@@ -388,6 +422,8 @@ function getStatsFunnel() {
     LEFT JOIN consultations  c  ON c.calculation_id  = s.id
   `).get();
 
+  const abandoned = (row.emailed || 0) - (row.paid || 0);
+
   return {
     stages: [
       { name: 'Quiz avviato',           value: row.started   || 0 },
@@ -395,7 +431,23 @@ function getStatsFunnel() {
       { name: 'Pagamento completato',   value: row.paid      || 0 },
       { name: 'Consulenza generata',    value: row.consulted || 0 },
     ],
+    abandoned: abandoned > 0 ? abandoned : 0,
+    email_to_pay_rate: row.emailed > 0 ? parseFloat(((row.paid / row.emailed) * 100).toFixed(1)) : 0,
   };
+}
+
+function getStatsRevenueBreakdown() {
+  const rows = db.prepare(`
+    SELECT
+      COALESCE(selected_price, 'unknown') AS price_key,
+      COUNT(*) AS count,
+      COALESCE(SUM(CAST(selected_price AS REAL)), 0) AS total_rev
+    FROM sessions
+    WHERE payment_status = 'paid'
+    GROUP BY selected_price
+    ORDER BY CAST(COALESCE(selected_price, '0') AS REAL) DESC
+  `).all();
+  return { breakdown: rows };
 }
 
 function getStatsRealtime() {
@@ -404,6 +456,21 @@ function getStatsRealtime() {
     SELECT COUNT(*) AS active FROM sessions WHERE created_at >= ?
   `).get(cutoff);
   return { active: row.active || 0 };
+}
+
+/**
+ * Delete a session and all associated rows (email, consultation).
+ * Also removes the PDF file from disk if present.
+ */
+function deleteSession(id) {
+  db.transaction(function () {
+    db.prepare('DELETE FROM sessions       WHERE id = ?').run(id);
+    db.prepare('DELETE FROM session_emails WHERE calculation_id = ?').run(id);
+    db.prepare('DELETE FROM consultations  WHERE calculation_id = ?').run(id);
+  })();
+  // Remove cached PDF if present
+  const pdfPath = path.join(__dirname, 'storage', 'reports', 'report_' + id + '.pdf');
+  try { if (fs.existsSync(pdfPath)) { fs.unlinkSync(pdfPath); } } catch (_) {}
 }
 
 module.exports = {
@@ -420,7 +487,9 @@ module.exports = {
   getAbandonedCandidates,
   getAllSessions,
   getAdminSession,
+  deleteSession,
   getStatsOverview,
   getStatsFunnel,
   getStatsRealtime,
+  getStatsRevenueBreakdown,
 };
