@@ -216,20 +216,35 @@ async function generatePremiumPDF(data, calculationId) {
   }
 
   // ── Puppeteer ──────────────────────────────────────────────────────────────
+  // Retry up to 3 times with 3s delay — handles `spawn ETXTBSY` that occurs
+  // on Render right after deploy when the Chromium binary is still being synced.
   let browser;
+  const MAX_BROWSER_ATTEMPTS = 3;
+  for (let attempt = 1; attempt <= MAX_BROWSER_ATTEMPTS; attempt++) {
+    try {
+      const executablePath = await chromium.executablePath();
+      browser = await puppeteer.launch({
+        headless: chromium.headless,
+        executablePath,
+        args: [
+          ...chromium.args,
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-dev-shm-usage',
+          '--font-render-hinting=none',
+        ],
+      });
+      break; // success
+    } catch (launchErr) {
+      if (launchErr.code === 'ETXTBSY' && attempt < MAX_BROWSER_ATTEMPTS) {
+        console.warn('[pdfGenerator] Chromium spawn ETXTBSY on attempt', attempt, '— retrying in 3s…');
+        await new Promise(function (r) { setTimeout(r, 3000); });
+      } else {
+        throw launchErr;
+      }
+    }
+  }
   try {
-    const executablePath = await chromium.executablePath();
-    browser = await puppeteer.launch({
-      headless: chromium.headless,
-      executablePath,
-      args: [
-        ...chromium.args,
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--font-render-hinting=none',
-      ],
-    });
 
     const page = await browser.newPage();
     await page.setContent(html, { waitUntil: 'networkidle0', timeout: 30000 });

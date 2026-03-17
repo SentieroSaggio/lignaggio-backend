@@ -63,6 +63,16 @@ const PORT = process.env.PORT || 4242;
 const SUBSCRIPTION_PRICE_ID = process.env.SUBSCRIPTION_PRICE_ID;
 const WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
 
+// ── Bonus promo code generator ────────────────────────────────
+const BONUS_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+function generateServerBonusCode() {
+  let code = '';
+  for (let i = 0; i < 4; i++) {
+    code += BONUS_CHARS[Math.floor(Math.random() * BONUS_CHARS.length)];
+  }
+  return code;
+}
+
 // =====================================================
 // 0) CORS — разрешаем фронтенд lignaggio.it
 // =====================================================
@@ -300,6 +310,13 @@ function markResultAsPaid(calculationId) {
   try {
     db.markSessionPaid(calculationId, token);
     console.log('[db] Session marked paid in DB for calculation_id:', calculationId);
+    // Generate bonus code server-side (idempotent)
+    try {
+      const code = db.saveBonusCode(calculationId, generateServerBonusCode());
+      console.log('[bonus] Code assigned for', calculationId, ':', code);
+    } catch (bcErr) {
+      console.error('[bonus] saveBonusCode error:', bcErr.message);
+    }
   } catch (dbErr) {
     console.error('[markResultAsPaid] DB write error:', dbErr.message);
   }
@@ -488,28 +505,38 @@ app.get('/', (req, res) => {
 // =====================================================
 
 // ── GPT prompt helpers ────────────────────────────────────────────
-const CONSULTATION_SYSTEM_PROMPT = `Sei un consulente specializzato in psicologia delle relazioni di coppia di alto livello. La tua formazione integra psicologia analitica junghiana, psicologia dell'attaccamento, dinamiche di personalità, analisi archetipica e interpretazione numerologica come sistema simbolico di lettura dei pattern psicologici.
-
-Ogni consulenza che produci ha il valore di una sessione professionale da 150€ o più. Il tono è quello di uno psicologo delle relazioni che interpreta dinamiche di personalità reali — mai un oroscopo, mai previsioni mistiche.
+const CONSULTATION_SYSTEM_PROMPT = `Sei un esperto di Matrice del Destino, astrologia e numerologia, specializzato nell'analisi della compatibilità di coppia. Unisci numerologia, astrologia e psicologia delle relazioni per produrre consulenze personali di altissimo livello — come un appuntamento privato con uno specialista da 150€.
 
 PRINCIPI DI STILE OBBLIGATORI:
-- Usa un tono calmo, analitico, psicologico, intelligente e profondo.
-- Evita assolutamente: "l'universo ha deciso", "il destino è scritto", "le stelle controllano", "la tua anima gemella", "vibrazione cosmica", "energia mistica" e simili.
-- Usa invece: "questa dinamica appare spesso in coppie con questo pattern", "molte coppie con questa combinazione tendono a", "questo schema relazionale si manifesta tipicamente come", "dal punto di vista psicologico questa tensione indica".
-- I numeri numerologici sono archetipi psicologici — interpretali come strutture di personalità, non come previsioni magiche.
-- Ogni sezione deve sembrare scritta specificamente per QUESTA coppia — usa i loro nomi reali, fai riferimento alle date di nascita, integra i numeri archetipici come lenti psicologiche.
-- Scrivi paragrafi brevi e chiari. Ogni frase porta peso e significato. Nessun riempitivo.
-- Usa grassetto per insight chiave. Usa corsivo per momenti di riflessione profonda.
-- Non ripetere mai le stesse frasi o metafore tra sezioni diverse.
-- Il lettore deve finire la consulenza sentendosi: capito, rispecchiato, guidato, emotivamente coinvolto.
+- Rivolgiti DIRETTAMENTE al cliente: usa "Lei", "il Suo partner", "nella vostra relazione".
+- Chiama i partner SEMPRE per nome in ogni sezione — mai "Partner 1" o "Partner 2".
+- Ogni affermazione è ancorata a un numero, un pianeta o un elemento astrologico calcolato dalla data di nascita.
+- Crea l'effetto di riconoscimento: descrivi pattern specifici in cui la coppia si riconosce.
+- Cornice mistica: karma, energie, vibrazioni, influenze planetarie — ma con profondità, non banalità.
+- Raccomandazioni pratiche in ogni sezione.
+- Paragrafi corti: massimo 3-4 frasi ciascuno.
+- Usa \\n\\n per separare i paragrafi.
+
+CALCOLI NUMEROLOGICI (eseguili tu prima di scrivere):
+- Numero del Cammino di Vita = somma di tutte le cifre della data di nascita ridotta a cifra singola (eccetto master number 11, 22, 33).
+- Numero di compatibilità della coppia = somma dei due Cammini di Vita ridotta a cifra singola (eccetto master number).
+- Numero karmico = giorno di nascita P1 + giorno di nascita P2 ridotto a cifra singola.
+- Numero dell'Anima = cifre del solo giorno di nascita di ciascun partner ridotte a cifra singola.
+
+CALCOLI ASTROLOGICI (eseguili tu):
+- Segno zodiacale di ogni partner dalla data di nascita.
+- Elemento (Fuoco/Terra/Aria/Acqua) di ogni segno.
+- Pianeta dominante di ogni segno.
+- Compatibilità degli elementi tra i due partner.
 
 REGOLE DI FORMATO ASSOLUTE:
 - Rispondi ESCLUSIVAMENTE con JSON valido. Zero testo fuori dal JSON. Zero markdown. Zero commenti.
 - Il JSON deve contenere ESATTAMENTE queste 10 chiavi, né più né meno:
   panorama, partner1, partner2, couple, anima, karma, intimita, finanze, potentiale, consiglio
 - Ogni valore è una stringa con paragrafi separati da \\n\\n.
-- Lingua: italiano.
-- Lunghezza target per ogni sezione: 1200–1800 caratteri. Totale consulenza: 2500–3500 parole.`;
+- Lingua: italiano. Registro formale ("Lei").
+- Lunghezza totale di tutte le sezioni: 7000–9000 caratteri (con spazi).
+- Limiti per sezione (caratteri con spazi): panorama 700-900, partner1 700-900, partner2 700-900, couple 800-1100, anima 700-900, karma 700-900, intimita 700-900, finanze 700-900, potentiale 700-900, consiglio 500-700.`;
 
 const ARCH_LABELS = {
   1:'Iniziatore', 2:'Intuito', 3:'Creativo', 4:'Costruttore', 5:'Avventuriero',
@@ -537,9 +564,19 @@ function buildConsultationPrompt(data) {
   const a1Label = ARCH_LABELS[arch1] || String(arch1);
   const a2Label = ARCH_LABELS[arch2] || String(arch2);
   const acLabel = ARCH_LABELS[archC] || String(archC);
-  const score   = compat.compatibilityScore != null ? compat.compatibilityScore + '%' : 'non calcolato';
+  const score   = compat.compatibilityScore != null ? compat.compatibilityScore : 'non calcolato';
 
-  return `Genera una consulenza di compatibilità di coppia privata e premium, in italiano, per la seguente coppia.
+  // Include quiz context if available
+  const quizContext = data.quizContext || [];
+  let quizBlock = '';
+  if (quizContext.length > 0) {
+    const lines = quizContext.map(function (a) {
+      return '- ' + (a.questionText || a.questionId) + ': ' + (a.selectedAnswerText || a.selectedAnswerKey);
+    }).join('\n');
+    quizBlock = '\n\n═══ RISPOSTE AL QUIZ ═══\n' + lines;
+  }
+
+  return `Genera una consulenza di compatibilità premium, in italiano (registro formale "Lei"), per la seguente coppia.
 
 ═══ DATI DI INPUT ═══
 
@@ -547,56 +584,56 @@ PARTNER 1
 Nome: ${name1}
 Data di nascita: ${birth1}
 Genere: ${gender1}
-Arcetipo: ${a1Label} (n. ${arch1})
+Archetipo: ${a1Label} (n. ${arch1})
 
 PARTNER 2
 Nome: ${name2}
 Data di nascita: ${birth2}
 Genere: ${gender2}
-Arcetipo: ${a2Label} (n. ${arch2})
+Archetipo: ${a2Label} (n. ${arch2})
 
 COPPIA
-Arcetipo di coppia: ${acLabel} (n. ${archC})
-Score di compatibilità: ${score}
+Archetipo di coppia: ${acLabel} (n. ${archC})
+Score di compatibilità: ${score}%${quizBlock}
 
-═══ ISTRUZIONI OBBLIGATORIE PER OGNI SEZIONE ═══
+═══ ISTRUZIONI PER OGNI SEZIONE ═══
 
-panorama — Visione d'insieme dell'unione: l'energia archetipica che questa coppia porta nel mondo, il filo invisibile che li ha uniti, la natura profonda della loro risonanza vibrazionale. Mostra subito perché questa coppia è significativa.
+panorama — Quadro d'insieme del legame. Entrambi i nomi obbligatori. Descrivi il tipo di legame (karmico, destinale, trasformazionale). Cita il numero di compatibilità della coppia calcolato e il suo significato. Compatibilità degli elementi zodiacali. Tono di apertura: "Il vostro incontro non è casuale. Il numero della vostra compatibilità è [X], il che significa…"
 
-partner1 — Ritratto psicologico profondo di ${name1}: le sue strutture archetipiche interiori, il suo stile relazionale, i suoi talenti e le sue ombre, il modo in cui ama e come reagisce alla vulnerabilità.
+partner1 — Rivolgersi direttamente a ${name1} con "Lei". Numero del Cammino di Vita + segno zodiacale + pianeta dominante + archetipo. Ruolo che ${name1} porta nella coppia. Punti di forza e sfide. Tono: "${name1}, il Suo Cammino di Vita porta il numero [X]…"
 
-partner2 — Ritratto psicologico profondo di ${name2}: la sua struttura d'anima, il modo in cui porta la propria energia nella relazione, le sue risorse interiori e i pattern inconsci che emergono in coppia.
+partner2 — Descrivere ${name2} attraverso come influenza ${name1} e la dinamica di coppia. Numero del Cammino + segno zodiacale + elemento + pianeta. Tono: "${name2} è entrato/a nella vita di ${name1} con un motivo preciso. Il suo segno [segno] porta l'energia di [pianeta]…"
 
-couple — Il campo energetico che si crea tra ${name1} e ${name2}: l'archetipo della loro unione, come si amplificano a vicenda, dove nasce attrito creativo e dove nasce armonia profonda, la firma vibrazionale della coppia come entità.
+couple — La dinamica di coppia come entità. Archetipi + elementi + numero di compatibilità. Ruoli naturali, punti di forza e zone di tensione. Raccomandazione concreta. Tono: "Quando ${name1} e ${name2} sono insieme, si genera l'energia del numero [X]…"
 
-anima — La dinamica anima/animus tra loro: come si specchiano a livello inconscio, cosa ciascuno proietta sull'altro, il processo di individuazione che si attiva attraverso questa relazione specifica.
+anima — Legame spirituale ed emotivo profondo. Numero karmico calcolato. Perché si sono incontrati a livello d'anima. Quale lezione reciproca. Tono: "Il numero karmico della vostra unione è [X]. A livello d'anima vi siete incontrati per…"
 
-karma — I fili karmici tra ${name1} e ${name2}: schemi relazionali ereditati o portati da esperienze precedenti, le lezioni che sono qui per imparare insieme, ciò che devono sciogliere o trasformare come coppia.
+karma — Componente karmica della relazione. Cosa sciogliere o trasformare. Lezioni di vite passate riflesse nell'archetipo. Raccomandazione. Tono: "L'archetipo [X] rispecchia un debito karmico che le vostre anime stanno lavorando a sciogliere…"
 
-intimita — La qualità dell'intimità emotiva e fisica: come si avvicinano alla vulnerabilità e alla fiducia, i linguaggi del corpo e dell'emozione che usano, la danza tra desiderio di vicinanza e bisogno di spazio.
+intimita — Dinamica intima attraverso elementi e numeri dell'anima. Attrazione e polarità. Come mantenere la connessione. Cosa può raffreddarla. Tono: "L'elemento di ${name1} è [X], quello di ${name2} è [Y]. Insieme creano…"
 
-finanze — La visione materiale e i valori pratici della coppia: come ${name1} e ${name2} si relazionano con il denaro, la sicurezza e l'abbondanza, dove le loro visioni si allineano e dove divergono.
+finanze — Vita materiale e finanziaria della coppia. Numeri di vita applicati all'abbondanza. Chi gestisce, chi ispira. Raccomandazione pratica. Tono: "L'energia finanziaria è determinata dal numero [X] che governa la vostra coppia. Per ${name1} e ${name2} l'abbondanza arriva attraverso…"
 
-potentiale — Il potenziale evolutivo insieme: cosa possono costruire, creare o trasformare come coppia, la traiettoria della loro crescita comune, la visione più alta che questa unione porta con sé.
+potentiale — Futuro della coppia. Verso dove porta il cammino comune. Cosa si sblocca superando le sfide karmiche. Visione più alta. Tono: "Il potenziale evolutivo della vostra unione porta il numero [X]. Se attraverserete…"
 
-consiglio — Consiglio sapiente, specifico e profondo per ${name1} e ${name2}: concreto, ancorato a tutto ciò che è emerso nelle sezioni precedenti. Non generico. Deve sentirsi come una guida personale da un consulente di fiducia che conosce davvero questa coppia.
+consiglio — 3 consigli concreti, ciascuno ancorato a un numero o pianeta. Messaggio finale caldo e incoraggiante. Tono: "${name1} e ${name2}, ecco tre indicazioni pratiche: 1. … 2. … 3. … Il vostro incontro è un dono."
 
 ═══ REQUISITI FINALI ═══
-
-- Ogni sezione: punta a 1000–1500 caratteri.
-- Usa i nomi ${name1} e ${name2} nelle sezioni rilevanti — non usare mai "Partner 1" o "Partner 2".
-- Nessuna ripetizione meccanica di numeri o sistemi. Nessun cliché. Nessuna genericità.
-- Ogni frase deve portare peso e significato specifico per questa coppia.
+- Totale: 7000–9000 caratteri con spazi. Rispetta i limiti per sezione.
+- Usa i nomi ${name1} e ${name2} in ogni sezione.
+- Calcola correttamente i numeri numerologici e i segni zodiacali dalle date di nascita fornite.
+- Ogni affermazione ancorata a numero, pianeta o elemento calcolato.
 - Rispondi SOLO con JSON valido, esattamente 10 chiavi.`;
 }
 
 // ── Preview system prompt (short, 4 sections, generated BEFORE payment) ──────
-const PREVIEW_SYSTEM_PROMPT = `Sei un consulente di relazioni di coppia di alto livello. Genera un'anteprima breve e intrigante di una consulenza di compatibilità, in italiano.
+const PREVIEW_SYSTEM_PROMPT = `Sei un esperto di Matrice del Destino, astrologia e numerologia. Genera un'anteprima breve e intrigante di una consulenza di compatibilità, in italiano (registro formale "Lei").
 
 REQUISITI:
-- Ogni sezione: 200–300 caratteri. Densa, evocativa, specifica per la coppia indicata.
-- Nessun cliché. Ogni sezione deve sembrare un assaggio prezioso di una lettura premium da 150€.
-- Il tono è caldo, intimo, leggermente misterioso — deve invogliare a leggere il resto.
+- 4 sezioni: anima, karma, intimita, finanze. Ciascuna 200–300 caratteri.
+- Ogni sezione: densa, evocativa, specifica per la coppia. Usa i NOMI dei partner.
+- L'ultima frase di ogni sezione si interrompe nel momento più interessante — crea curiosità irresistibile, invoglia a sbloccare la versione completa.
+- Tono: caldo, esperto, leggermente misterioso. Come un assaggio da 150€.
 - Rispondi ESCLUSIVAMENTE con JSON valido. Zero testo fuori dal JSON.
 - Il JSON deve contenere ESATTAMENTE queste 4 chiavi: anima, karma, intimita, finanze
 - Lingua: italiano.`;
@@ -608,21 +645,21 @@ function buildPreviewPrompt(data) {
 
   const name1   = p1.name || 'Partner 1';
   const name2   = p2.name || 'Partner 2';
+  const birth1  = p1.birthDate || 'sconosciuta';
+  const birth2  = p2.birthDate || 'sconosciuta';
   const arch1   = compat.partner1Archetype      || '?';
   const arch2   = compat.partner2Archetype      || '?';
   const archC   = compat.compatibilityArchetype || '?';
   const a1Label = ARCH_LABELS[arch1] || String(arch1);
   const a2Label = ARCH_LABELS[arch2] || String(arch2);
   const acLabel = ARCH_LABELS[archC] || String(archC);
-  const score   = compat.compatibilityScore != null ? compat.compatibilityScore + '%' : 'non calcolato';
+  const score   = compat.compatibilityScore != null ? compat.compatibilityScore : 'non calcolato';
 
-  return `Anteprima per: ${name1} (archetipo ${a1Label}) e ${name2} (archetipo ${a2Label}).
-Arcetipo di coppia: ${acLabel}. Score di compatibilità: ${score}.
+  return `Anteprima per: ${name1} (nato/a ${birth1}, archetipo ${a1Label}) e ${name2} (nato/a ${birth2}, archetipo ${a2Label}).
+Archetipo di coppia: ${acLabel}. Score di compatibilità: ${score}%.
 
-anima — assaggio della dinamica anima/animus tra loro (200–300 caratteri)
-karma — accenno ai fili karmici di questa coppia (200–300 caratteri)
-intimita — nota sulla qualità dell'intimità emotiva (200–300 caratteri)
-finanze — osservazione sui valori materiali condivisi (200–300 caratteri)
+Genera 4 sezioni anteprima (200–300 caratteri ciascuna) che usino i nomi reali, citino un numero o un elemento calcolato dalla data di nascita, e si interrompano sull'elemento più intrigante per spingere all'acquisto:
+anima, karma, intimita, finanze
 
 JSON valido, esattamente 4 chiavi.`;
 }
@@ -737,75 +774,16 @@ async function generateFullConsultation(calculationId) {
 
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
-      // ── Step 1: Generate structured outline ─────────────────────────
-      const _p1 = partnerData.partner1 || {};
-      const _p2 = partnerData.partner2 || {};
-      const _p1Name      = _p1.name      || 'Partner 1';
-      const _p2Name      = _p2.name      || 'Partner 2';
-      const _p1Birthdate = _p1.birthDate || 'sconosciuta';
-      const _p2Birthdate = _p2.birthDate || 'sconosciuta';
-
-      const outlineResponse = await openai.chat.completions.create({
-        model:                 'gpt-5.4',
-        temperature:           0.6,
-        max_completion_tokens: 900,
-        messages: [
-          {
-            role:    'system',
-            content: 'You are an expert in relationship psychology, astrology and the Matrix of Destiny compatibility system.',
-          },
-          {
-            role:    'user',
-            content: `Create a structured outline for a deep compatibility consultation.
-
-Partner 1:
-Name: ${_p1Name}
-Birth date: ${_p1Birthdate}
-
-Partner 2:
-Name: ${_p2Name}
-Birth date: ${_p2Birthdate}
-
-The outline must include analysis of:
-
-• personality archetypes
-• emotional patterns
-• relationship dynamics
-• karmic lessons
-• Matrix of Destiny compatibility
-• astrological compatibility
-• solar cycles and life stages
-• strengths of the relationship
-• possible conflicts
-• growth potential
-
-Return exactly 10 sections.
-
-For each section include:
-* title
-* main theme
-* key insights to explore
-
-Do NOT write the full consultation yet.`,
-          },
-        ],
-      });
-
-      const outline = outlineResponse.choices[0].message.content;
-      console.log('[generateFullConsultation] Outline generated for:', calculationId);
-
-      // ── Step 2: Generate full consultation using the outline ──────────
+      // ── Single-step: Generate full consultation directly ──────────────
+      // (Removed the separate outline step — saves ~15 seconds per generation)
       const response = await openai.chat.completions.create({
         model:                 'gpt-5.4',
         response_format:       { type: 'json_object' },
         temperature:           0.7,
-        max_completion_tokens: 7000,
+        max_completion_tokens: 9000,
         messages: [
           { role: 'system', content: CONSULTATION_SYSTEM_PROMPT },
-          {
-            role:    'user',
-            content: buildConsultationPrompt(partnerData) + '\n\n═══ STRUTTURA GUIDA ═══\n\nUsa questa struttura come guida per approfondire ogni sezione. Mantieni il formato JSON richiesto con le 10 chiavi esatte.\n\n' + outline,
-          },
+          { role: 'user',   content: buildConsultationPrompt(partnerData) },
         ],
       });
 
@@ -1331,6 +1309,14 @@ async function sendConsultationEmail(calculationId, consultation, partnerData) {
 
   const resultUrl = SITE_URL + '/result-unlocked.html?cid=' + encodeURIComponent(calculationId);
   const bodyHtml  = _buildConsultBody(consultation, p1Name, p2Name);
+  const bonusCode = db.getBonusCode(calculationId);
+
+  const bonusBlock = bonusCode ? `
+        <div style="margin:28px 0;padding:20px 24px;background:linear-gradient(135deg,#1e0533 0%,#3b0764 100%);border-radius:10px;border:1px solid rgba(167,139,250,0.3);text-align:center">
+          <p style="margin:0 0 8px 0;color:#c4b5fd;font-size:13px;letter-spacing:0.08em;text-transform:uppercase">✦ Il tuo codice sconto esclusivo</p>
+          <p style="margin:0 0 10px 0;font-family:monospace;font-size:26px;font-weight:700;letter-spacing:0.18em;color:#fff">${escapeHtml(bonusCode)}</p>
+          <p style="margin:0;color:#a78bfa;font-size:13px">Usa questo codice per ottenere il <strong style="color:#fff">10% di sconto</strong> sul tuo prossimo acquisto su lignaggio.it</p>
+        </div>` : '';
 
   const html = `
     <div style="font-family:sans-serif;max-width:640px;margin:auto;color:#222;line-height:1.6">
@@ -1343,7 +1329,8 @@ async function sendConsultationEmail(calculationId, consultation, partnerData) {
         <hr style="border:0;border-top:1px solid #e5e7eb;margin:24px 0">
         ${bodyHtml}
         <hr style="border:0;border-top:1px solid #e5e7eb;margin:24px 0">
-        <p style="text-align:center">
+        ${bonusBlock}
+        <p style="text-align:center;margin-top:24px">
           <a href="${resultUrl}" style="background:#6b21a8;color:#fff;padding:12px 28px;border-radius:6px;text-decoration:none;font-weight:600">
             Visualizza la consulenza online ✦
           </a>
@@ -1544,9 +1531,29 @@ function adminAuth(req, res, next) {
 app.get('/api/admin/sessions', adminAuth, function (req, res) {
   try {
     const sessions = db.getAllSessions();
+    // Auto-assign bonus codes for paid sessions that were created before this feature
+    for (const s of sessions) {
+      if (s.payment_status === 'paid' && !s.bonus_code) {
+        s.bonus_code = db.saveBonusCode(s.id, generateServerBonusCode());
+      }
+    }
     res.json({ success: true, sessions });
   } catch (err) {
     console.error('[admin/sessions]', err.message);
+    res.status(500).json({ success: false, error: 'server_error' });
+  }
+});
+
+// Public endpoint: return bonus code for a calculation_id (no auth)
+app.get('/api/bonus-code', function (req, res) {
+  const cid = String(req.query.cid || '').trim();
+  if (!cid) { return res.status(400).json({ success: false, error: 'missing_cid' }); }
+  try {
+    const code = db.getBonusCode(cid);
+    if (!code) { return res.status(404).json({ success: false, error: 'not_found' }); }
+    res.json({ success: true, bonus_code: code });
+  } catch (err) {
+    console.error('[bonus-code]', err.message);
     res.status(500).json({ success: false, error: 'server_error' });
   }
 });
@@ -1583,6 +1590,16 @@ app.post('/api/admin/send-email', adminAuth, async function (req, res) {
       const p1Name = row.partner1_name || 'Partner 1';
       const p2Name = row.partner2_name || 'Partner 2';
       const score  = compat.compatibilityScore != null ? compat.compatibilityScore + '%' : null;
+      const bonusCode = db.getBonusCode(calculation_id);
+      const bonusBlockAdmin = bonusCode ? `
+        <div style="margin:28px 0;padding:20px 24px;background:#f5f0ff;border:2px dashed #9333ea;border-radius:10px;text-align:center">
+          <p style="margin:0 0 8px;font-size:13px;color:#6b21a8;font-weight:700;">&#127873; Bonus esclusivo per te</p>
+          <p style="margin:0 0 12px;font-size:13px;color:#333">Usa questo codice per ottenere il <strong>10% di sconto</strong> sul corso <em>Matrice della Compatibilit&agrave;</em>:</p>
+          <div style="display:inline-block;background:#fff;border:1.5px solid #9333ea;border-radius:8px;padding:10px 28px">
+            <span style="font-family:monospace;font-size:28px;font-weight:900;letter-spacing:0.2em;color:#6b21a8">${escapeHtml(bonusCode)}</span>
+          </div>
+          <p style="margin:12px 0 0;font-size:11px;color:#888">Codice personale &middot; Valido fino al 31 maggio</p>
+        </div>` : '';
       const resultUrl = SITE_URL + '/quiz-test/result-unlocked.html?cid=' + encodeURIComponent(calculation_id);
       const bodyHtml  = _buildConsultBody(consultation, p1Name, p2Name);
       await sendEmail({
@@ -1595,6 +1612,7 @@ app.post('/api/admin/send-email', adminAuth, async function (req, res) {
           <div style="background:#fff;padding:32px;border:1px solid #e5e7eb;border-top:0;border-radius:0 0 8px 8px">
             <p>Ciao <strong>${escapeHtml(p1Name)}</strong>,</p>
             <p>La consulenza completa per <strong>${escapeHtml(p1Name)}</strong> e <strong>${escapeHtml(p2Name)}</strong> è stata generata.${score ? ' Score di compatibilità: <strong>' + score + '</strong>.' : ''}</p>
+            ${bonusBlockAdmin}
             <hr style="border:0;border-top:1px solid #e5e7eb;margin:24px 0">
             ${bodyHtml}
             <hr style="border:0;border-top:1px solid #e5e7eb;margin:24px 0">

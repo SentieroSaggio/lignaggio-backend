@@ -12,12 +12,17 @@ const crypto   = require('crypto');
 const Database = require('better-sqlite3');
 
 // ── Ensure database directory exists ────────────────────────────────────────
-const DB_DIR  = path.join(__dirname, 'database');
+// On Render: set DB_PATH env var to a path on the persistent disk, e.g.:
+//   DB_PATH=/var/data/quiz.db
+// (Add a Render Disk mounted at /var/data to persist data across restarts)
+const DB_DIR  = process.env.DB_PATH
+  ? require('path').dirname(process.env.DB_PATH)
+  : path.join(__dirname, 'database');
 if (!fs.existsSync(DB_DIR)) {
   fs.mkdirSync(DB_DIR, { recursive: true });
 }
 
-const DB_PATH = path.join(DB_DIR, 'quiz.db');
+const DB_PATH = process.env.DB_PATH || path.join(DB_DIR, 'quiz.db');
 
 // Open (or create) the database
 const db = new Database(DB_PATH);
@@ -65,6 +70,7 @@ db.exec(`
 try { db.exec('ALTER TABLE session_emails ADD COLUMN thank_you_sent INTEGER DEFAULT 0'); } catch (_) {}
 try { db.exec('ALTER TABLE session_emails ADD COLUMN abandoned_sent INTEGER DEFAULT 0'); } catch (_) {}
 try { db.exec('ALTER TABLE sessions ADD COLUMN selected_price TEXT'); } catch (_) {}
+try { db.exec('ALTER TABLE sessions ADD COLUMN bonus_code TEXT'); } catch (_) {}
 // Normalize timestamps stored as Unix seconds → milliseconds
 // Any value < 10 billion is seconds-based (covers all dates up to ~2286 in seconds)
 try {
@@ -127,6 +133,14 @@ const stmtMarkThankYouSent = db.prepare(`
 
 const stmtMarkAbandonedSent = db.prepare(`
   UPDATE session_emails SET abandoned_sent = 1 WHERE calculation_id = ?
+`);
+
+const stmtSaveBonusCode = db.prepare(`
+  UPDATE sessions SET bonus_code = @bonus_code WHERE id = @id
+`);
+
+const stmtGetBonusCode = db.prepare(`
+  SELECT bonus_code FROM sessions WHERE id = ?
 `);
 
 const stmtGetAbandonedCandidates = db.prepare(`
@@ -247,6 +261,25 @@ function markAbandonedSent(calculationId) {
 /**
  * Return sessions that left an email but didn't pay, older than minAgeMs.
  */
+/**
+ * Save a bonus promo code for a session (idempotent — only sets if not already set).
+ */
+function saveBonusCode(calculationId, code) {
+  // Only write if not already assigned (idempotent)
+  const existing = stmtGetBonusCode.get(calculationId);
+  if (existing && existing.bonus_code) { return existing.bonus_code; }
+  stmtSaveBonusCode.run({ id: calculationId, bonus_code: code });
+  return code;
+}
+
+/**
+ * Get the bonus code for a session, or null.
+ */
+function getBonusCode(calculationId) {
+  const row = stmtGetBonusCode.get(calculationId);
+  return (row && row.bonus_code) || null;
+}
+
 function getAbandonedCandidates(minAgeMs) {
   const cutoff = Date.now() - minAgeMs;
   return stmtGetAbandonedCandidates.all({ cutoff });
@@ -260,6 +293,7 @@ const stmtGetAllSessions = db.prepare(`
     s.partner2_name, s.partner2_birth,
     s.payment_status,
     s.compatibility_json,
+    s.bonus_code,
     s.created_at,
     se.email,
     CASE WHEN c.id IS NOT NULL THEN 1 ELSE 0 END AS consultation_ready
@@ -294,6 +328,7 @@ function getAllSessions() {
       partner2_birth:      r.partner2_birth || null,
       payment_status:      r.payment_status || 'pending',
       compatibility_score: compat.compatibilityScore != null ? compat.compatibilityScore : null,
+      bonus_code:          r.bonus_code || null,
       created_at:          r.created_at,
       consultation_ready:  Boolean(r.consultation_ready),
     };
@@ -320,6 +355,7 @@ function getAdminSession(id) {
     preview:        preview,
     consultation:   consult,
     consultation_ready: Boolean(r.consultation_ready),
+    bonus_code:     r.bonus_code || null,
     created_at:     r.created_at,
   };
 }
@@ -484,8 +520,8 @@ module.exports = {
   getSessionEmail,
   markThankYouSent,
   markAbandonedSent,
-  getAbandonedCandidates,
-  getAllSessions,
+  getAbandonedCandidates,  saveBonusCode,
+  getBonusCode,  getAllSessions,
   getAdminSession,
   deleteSession,
   getStatsOverview,
