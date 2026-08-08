@@ -13,6 +13,9 @@ const db = require('../db');
 // ── PDF generator ─────────────────────────────────────────────────────────
 const { generatePremiumPDF } = require('../services/pdfGenerator');
 
+// ── Keitaro attribution (analytics side effect — never blocks a payment) ──
+const keitaro = require('../services/keitaro');
+
 // -----------------------------------------------------
 // Конфиг цен (price_id берём из переменных окружения)
 // -----------------------------------------------------
@@ -89,6 +92,97 @@ app.use(
 );
 
 // =====================================================
+// 0) KEITARO — sale postback after a confirmed Stripe payment
+// =====================================================
+
+/**
+ * Send the Keitaro sale postback for a confirmed PaymentIntent.
+ *
+ * Called fire-and-forget from the webhook: this is attribution, so nothing it
+ * does — including total failure — may affect the payment or the customer's
+ * access to what they bought.
+ *
+ * Skips silently when:
+ *   - the PaymentIntent belongs to an invoice (subscription renewal). Only the
+ *     first, one-time purchase counts as the acquisition sale;
+ *   - no click id is attached (organic traffic — the normal case);
+ *   - another webhook delivery already claimed this payment id.
+ *
+ * @param {import('stripe').Stripe.PaymentIntent} paymentIntent
+ * @returns {Promise<void>}
+ */
+async function dispatchKeitaroSale(paymentIntent) {
+  try {
+    const paymentId = paymentIntent && paymentIntent.id;
+    if (!paymentId) { return; }
+
+    // Renewals arrive as their own payment_intent.succeeded but carry an
+    // invoice. Acquisition = the initial one-time payment only.
+    if (paymentIntent.invoice) {
+      console.log('[keitaro] Payment', paymentId, 'belongs to an invoice (subscription renewal) — not an acquisition sale.');
+      return;
+    }
+
+    const metadata      = paymentIntent.metadata || {};
+    const calculationId = metadata.calculation_id || '';
+
+    // Metadata is the primary source; the DB is the fallback in case the
+    // PaymentIntent was created before the click id reached us.
+    let subid = keitaro.sanitizeSubid(metadata.keitaro_subid);
+    if (!subid && calculationId) {
+      try { subid = keitaro.sanitizeSubid(db.getSubid(calculationId)); } catch (_) { subid = ''; }
+    }
+
+    if (!subid) {
+      console.log('[keitaro] Payment', paymentId, '— no click id, organic conversion, nothing to report.');
+      return;
+    }
+
+    // Atomic claim. A Stripe webhook retry loses this race and returns false.
+    let owned = false;
+    try {
+      owned = db.claimPostback(paymentId, subid);
+    } catch (dbErr) {
+      console.error('[keitaro] Could not claim postback for', paymentId, '—', dbErr.message);
+      return; // better to miss a conversion than to risk sending it twice
+    }
+
+    if (!owned) {
+      console.log('[keitaro] Duplicate skipped — postback for', paymentId, 'was already claimed.');
+      return;
+    }
+
+    // amount_received is the confirmed figure; amount is the fallback.
+    const amountMinor = typeof paymentIntent.amount_received === 'number' && paymentIntent.amount_received > 0
+      ? paymentIntent.amount_received
+      : paymentIntent.amount;
+
+    console.log('[keitaro] Reporting sale — payment', paymentId,
+                '| click id present | amount', amountMinor, paymentIntent.currency);
+
+    const outcome = await keitaro.sendSalePostback({
+      subid,
+      paymentId,
+      amountMinor,
+      currency: paymentIntent.currency,
+    });
+
+    try {
+      db.finishPostback(paymentId, {
+        status:     outcome.status,
+        httpStatus: outcome.httpStatus,
+        attempts:   outcome.attempts,
+      });
+    } catch (dbErr) {
+      console.error('[keitaro] Could not record postback outcome for', paymentId, '—', dbErr.message);
+    }
+  } catch (err) {
+    // Belt and braces: this function must never surface an error to the webhook.
+    console.error('[keitaro] Unexpected error while reporting sale:', err && err.message);
+  }
+}
+
+// =====================================================
 // 1) WEBHOOK — ОБЯЗАТЕЛЬНО ДО ЛЮБЫХ body-parser’ов
 // =====================================================
 /**
@@ -127,6 +221,11 @@ app.post(
         const customerId    = paymentIntent.customer;
         const paymentMethodId = paymentIntent.payment_method;
         const metadata      = paymentIntent.metadata || {};
+
+        // Keitaro attribution. Fire-and-forget on purpose: the webhook must
+        // answer Stripe quickly, and a tracking failure must never delay or
+        // affect delivery of the paid product.
+        dispatchKeitaroSale(paymentIntent);
 
         // ── New compatibility quiz: mark result as paid, persist to DB ──────────
         const calculationId = metadata.calculation_id;
@@ -350,7 +449,7 @@ function markResultAsPaid(calculationId) {
 app.post('/create-payment-intent', async (req, res) => {
   try {
     // Old quiz fields + new compatibility quiz optional fields (calculation_id, compatibility_score, priceId)
-    const { name, email, arch, archetype, price, calculation_id, compatibility_score, priceId } = req.body || {};
+    const { name, email, arch, archetype, price, calculation_id, compatibility_score, priceId, subid } = req.body || {};
 
     if (!email) {
       return res.status(400).json({ error: 'Missing email' });
@@ -381,6 +480,22 @@ app.post('/create-payment-intent', async (req, res) => {
       });
     }
 
+    // ── Keitaro click id ────────────────────────────────────────────────────
+    // Prefer the value already stored against this session (written when the
+    // analysis page called /api/generate-preview); fall back to the request
+    // body for the case where that call never landed. Both are sanitized.
+    let attributionSubid = '';
+    if (calculation_id) {
+      try { attributionSubid = keitaro.sanitizeSubid(db.getSubid(calculation_id)); } catch (_) {}
+    }
+    if (!attributionSubid) {
+      attributionSubid = keitaro.sanitizeSubid(subid);
+      // Backfill so the webhook can still resolve it from the DB.
+      if (attributionSubid && calculation_id) {
+        try { db.saveSubid(calculation_id, attributionSubid); } catch (_) {}
+      }
+    }
+
     const paymentIntent = await stripe.paymentIntents.create({
       amount: amountInfo.amount,
       currency: amountInfo.currency,
@@ -398,6 +513,8 @@ app.post('/create-payment-intent', async (req, res) => {
         // New compatibility quiz fields (empty string when not sent by old quizzes)
         calculation_id:      calculation_id             || '',
         compatibility_score: compatibility_score != null ? String(compatibility_score) : '',
+        // Ad attribution — read back by the webhook to report the sale
+        keitaro_subid:       attributionSubid,
       },
     });
 
@@ -734,6 +851,7 @@ async function resolvePartnerDataWithRetry(calculationId, maxRetries, delayMs) {
             partner1:      { name: row.partner1_name, gender: row.partner1_gender, birthDate: row.partner1_birth },
             partner2:      { name: row.partner2_name, gender: row.partner2_gender, birthDate: row.partner2_birth },
             compatibility: compat,
+            quizContext:   row.quiz_context_json ? JSON.parse(row.quiz_context_json) : [],
           },
           payment: {
             status:      row.payment_status,
@@ -879,11 +997,44 @@ function validatePartner(partner, label) {
   return null; // valid
 }
 
+// ── POST /api/save-email ────────────────────────────────────────────────────────
+// Called from the analysis page as soon as the user submits the email modal.
+//
+// Until this existed the address was only persisted inside /create-payment-intent,
+// i.e. once the user had already opened the checkout form. Everyone who dropped
+// off between the analysis page and checkout — exactly the audience the
+// abandoned-cart email targets — was never stored and never contacted.
+//
+// saveSessionEmail is INSERT OR IGNORE, so calling this repeatedly (or again
+// later from the payment intent) never resets thank_you_sent / abandoned_sent.
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+app.post('/api/save-email', (req, res) => {
+  const { calculation_id, email } = req.body || {};
+
+  if (!calculation_id || !String(calculation_id).trim()) {
+    return res.status(400).json({ success: false, error: 'missing_calculation_id' });
+  }
+  const address = String(email || '').trim();
+  if (!address || address.length > 254 || !EMAIL_RE.test(address)) {
+    return res.status(400).json({ success: false, error: 'invalid_email' });
+  }
+
+  try {
+    db.saveSessionEmail(String(calculation_id).trim(), address);
+    console.log('[save-email] Stored for calculation_id:', calculation_id);
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('[save-email] DB error:', err.message);
+    return res.status(500).json({ success: false, error: 'server_error' });
+  }
+});
+
 // ── POST /api/generate-preview ──────────────────────────────────────────────────
 // Called during the analysis phase, BEFORE payment.
 // Creates the stored entry and generates a short 4-section teaser preview.
 app.post('/api/generate-preview', async (req, res) => {
-  const { calculation_id, partner1, partner2, compatibility } = req.body || {};
+  const { calculation_id, partner1, partner2, compatibility, quizContext, subid } = req.body || {};
 
   if (!calculation_id || !String(calculation_id).trim()) {
     return res.status(400).json({ success: false, error: 'missing_calculation_id' });
@@ -921,17 +1072,30 @@ app.post('/api/generate-preview', async (req, res) => {
 
   // ── Insert session row in DB (idempotent: INSERT OR IGNORE) ───────────────
   try {
-    db.insertSession(calculation_id, partner1, partner2, compat);
+    db.insertSession(calculation_id, partner1, partner2, compat, quizContext);
     console.log('[db] Session inserted for calculation_id:', calculation_id);
   } catch (dbErr) {
     console.error('[generate-preview] DB insert error:', dbErr.message);
+  }
+
+  // ── Keitaro click id ──────────────────────────────────────────────────────
+  // Untrusted browser input: only the validated shape is stored, and the first
+  // click id recorded for a session wins.
+  const cleanSubid = keitaro.sanitizeSubid(subid);
+  if (cleanSubid) {
+    try {
+      db.saveSubid(calculation_id, cleanSubid);
+      console.log('[generate-preview] Click id attached to', calculation_id);
+    } catch (dbErr) {
+      console.error('[generate-preview] Could not store click id:', dbErr.message);
+    }
   }
 
   // ── Create or refresh in-memory entry ────────────────────────────────────
   if (!generatedResults[calculation_id]) {
     generatedResults[calculation_id] = {
       calculationId: calculation_id,
-      _partnerData:  { partner1: partner1 || {}, partner2: partner2 || {}, compatibility: compat },
+      _partnerData:  { partner1: partner1 || {}, partner2: partner2 || {}, compatibility: compat, quizContext: quizContext || [] },
       payment: {
         status:          'pending',
         paymentIntentId: null,
@@ -1015,6 +1179,7 @@ app.post('/api/generate-consultation', async (req, res) => {
             partner1:      { name: row.partner1_name, gender: row.partner1_gender, birthDate: row.partner1_birth },
             partner2:      { name: row.partner2_name, gender: row.partner2_gender, birthDate: row.partner2_birth },
             compatibility: compat,
+            quizContext:   row.quiz_context_json ? JSON.parse(row.quiz_context_json) : [],
           },
           payment:       { status: row.payment_status, accessToken: row.access_token },
           preview,

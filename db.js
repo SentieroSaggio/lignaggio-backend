@@ -71,6 +71,29 @@ try { db.exec('ALTER TABLE session_emails ADD COLUMN thank_you_sent INTEGER DEFA
 try { db.exec('ALTER TABLE session_emails ADD COLUMN abandoned_sent INTEGER DEFAULT 0'); } catch (_) {}
 try { db.exec('ALTER TABLE sessions ADD COLUMN selected_price TEXT'); } catch (_) {}
 try { db.exec('ALTER TABLE sessions ADD COLUMN bonus_code TEXT'); } catch (_) {}
+// Quiz answers — used by buildConsultationPrompt to personalise the reading.
+try { db.exec('ALTER TABLE sessions ADD COLUMN quiz_context_json TEXT'); } catch (_) {}
+// Keitaro click id captured from ?subid= on the landing page.
+try { db.exec('ALTER TABLE sessions ADD COLUMN keitaro_subid TEXT'); } catch (_) {}
+
+/**
+ * One row per Stripe payment for which a Keitaro sale postback was attempted.
+ *
+ * payment_id is the PRIMARY KEY, which is what makes the postback idempotent:
+ * Stripe retries webhooks, and INSERT OR IGNORE lets exactly one caller win the
+ * claim. better-sqlite3 is synchronous, so the claim is atomic.
+ */
+db.exec(`
+  CREATE TABLE IF NOT EXISTS keitaro_postbacks (
+    payment_id      TEXT PRIMARY KEY,
+    subid           TEXT NOT NULL,
+    postback_status TEXT DEFAULT 'pending',
+    http_status     INTEGER,
+    attempts        INTEGER DEFAULT 0,
+    sent_at         INTEGER,
+    created_at      INTEGER
+  );
+`);
 // Normalize timestamps stored as Unix seconds → milliseconds
 // Any value < 10 billion is seconds-based (covers all dates up to ~2286 in seconds)
 try {
@@ -87,11 +110,25 @@ const stmtInsertSession = db.prepare(`
   INSERT OR IGNORE INTO sessions
     (id, partner1_name, partner1_gender, partner1_birth,
      partner2_name, partner2_gender, partner2_birth,
-     compatibility_json, preview_json, payment_status, access_token, created_at)
+     compatibility_json, quiz_context_json, preview_json,
+     payment_status, access_token, created_at)
   VALUES
     (@id, @partner1_name, @partner1_gender, @partner1_birth,
      @partner2_name, @partner2_gender, @partner2_birth,
-     @compatibility_json, @preview_json, @payment_status, @access_token, @created_at)
+     @compatibility_json, @quiz_context_json, @preview_json,
+     @payment_status, @access_token, @created_at)
+`);
+
+/**
+ * Fill in the quiz answers separately.
+ * insertSession uses INSERT OR IGNORE, so when the row already exists (the
+ * Stripe webhook can land before the preview request commits) the quiz answers
+ * from the INSERT are dropped. This backfills them without touching a row that
+ * already has them.
+ */
+const stmtUpdateQuizContext = db.prepare(`
+  UPDATE sessions SET quiz_context_json = @quiz_context_json
+   WHERE id = @id AND (quiz_context_json IS NULL OR quiz_context_json = '')
 `);
 
 const stmtUpdatePreview = db.prepare(`
@@ -125,6 +162,38 @@ const stmtSaveSessionEmail = db.prepare(`
 
 const stmtGetSessionEmail = db.prepare(`
   SELECT * FROM session_emails WHERE calculation_id = ?
+`);
+
+// ── Keitaro attribution ──────────────────────────────────────────────────────
+
+/** Store the click id, but never overwrite one that is already recorded. */
+const stmtSaveSubid = db.prepare(`
+  UPDATE sessions SET keitaro_subid = @subid
+   WHERE id = @id AND (keitaro_subid IS NULL OR keitaro_subid = '')
+`);
+
+const stmtGetSubid = db.prepare(`
+  SELECT keitaro_subid FROM sessions WHERE id = ?
+`);
+
+/** Atomic claim: only the first caller for a payment_id inserts a row. */
+const stmtClaimPostback = db.prepare(`
+  INSERT OR IGNORE INTO keitaro_postbacks
+    (payment_id, subid, postback_status, attempts, created_at)
+  VALUES (@payment_id, @subid, 'pending', 0, @created_at)
+`);
+
+const stmtFinishPostback = db.prepare(`
+  UPDATE keitaro_postbacks
+     SET postback_status = @postback_status,
+         http_status     = @http_status,
+         attempts        = @attempts,
+         sent_at         = @sent_at
+   WHERE payment_id = @payment_id
+`);
+
+const stmtGetPostback = db.prepare(`
+  SELECT * FROM keitaro_postbacks WHERE payment_id = ?
 `);
 
 const stmtMarkThankYouSent = db.prepare(`
@@ -161,7 +230,11 @@ const stmtGetAbandonedCandidates = db.prepare(`
  * @param {object} partner2 - { name, gender, birthDate }
  * @param {object} compatibility - full compatibility object
  */
-function insertSession(id, partner1, partner2, compatibility) {
+function insertSession(id, partner1, partner2, compatibility, quizContext) {
+  const quizJson = (Array.isArray(quizContext) && quizContext.length)
+    ? JSON.stringify(quizContext)
+    : null;
+
   stmtInsertSession.run({
     id,
     partner1_name:     (partner1 && partner1.name)      || null,
@@ -171,11 +244,17 @@ function insertSession(id, partner1, partner2, compatibility) {
     partner2_gender:   (partner2 && partner2.gender)    || null,
     partner2_birth:    (partner2 && partner2.birthDate) || null,
     compatibility_json: compatibility ? JSON.stringify(compatibility) : null,
+    quiz_context_json:  quizJson,
     preview_json:      null,
     payment_status:    'pending',
     access_token:      null,
     created_at:        Date.now(),
   });
+
+  // Covers the INSERT OR IGNORE case where the row already existed.
+  if (quizJson) {
+    stmtUpdateQuizContext.run({ id, quiz_context_json: quizJson });
+  }
 }
 
 /**
@@ -242,6 +321,69 @@ function saveSessionEmail(calculationId, email) {
  */
 function getSessionEmail(calculationId) {
   return stmtGetSessionEmail.get(calculationId) || null;
+}
+
+// ── Keitaro attribution ──────────────────────────────────────────────────────
+
+/**
+ * Attach a Keitaro click id to a session. First write wins, so a later request
+ * carrying a different (or empty) value cannot overwrite the original click.
+ * @param {string} calculationId
+ * @param {string} subid  already sanitized by the caller
+ */
+function saveSubid(calculationId, subid) {
+  if (!calculationId || !subid) { return; }
+  stmtSaveSubid.run({ id: calculationId, subid });
+}
+
+/**
+ * @param {string} calculationId
+ * @returns {string} stored click id, '' when none
+ */
+function getSubid(calculationId) {
+  if (!calculationId) { return ''; }
+  const row = stmtGetSubid.get(calculationId);
+  return (row && row.keitaro_subid) || '';
+}
+
+/**
+ * Try to become the one caller allowed to send the postback for this payment.
+ *
+ * @param {string} paymentId  Stripe PaymentIntent id
+ * @param {string} subid
+ * @returns {boolean} true when this caller owns the send, false when another
+ *                    delivery (a Stripe webhook retry) already claimed it
+ */
+function claimPostback(paymentId, subid) {
+  const result = stmtClaimPostback.run({
+    payment_id: paymentId,
+    subid,
+    created_at: Date.now(),
+  });
+  return result.changes === 1;
+}
+
+/**
+ * Record the outcome of a postback attempt.
+ * @param {string} paymentId
+ * @param {{status: string, httpStatus: number|null, attempts: number}} outcome
+ */
+function finishPostback(paymentId, outcome) {
+  stmtFinishPostback.run({
+    payment_id:      paymentId,
+    postback_status: outcome.status,
+    http_status:     outcome.httpStatus != null ? outcome.httpStatus : null,
+    attempts:        outcome.attempts || 0,
+    sent_at:         Date.now(),
+  });
+}
+
+/**
+ * @param {string} paymentId
+ * @returns {object|null}
+ */
+function getPostback(paymentId) {
+  return stmtGetPostback.get(paymentId) || null;
 }
 
 /**
@@ -520,6 +662,11 @@ module.exports = {
   getSessionEmail,
   markThankYouSent,
   markAbandonedSent,
+  saveSubid,
+  getSubid,
+  claimPostback,
+  finishPostback,
+  getPostback,
   getAbandonedCandidates,  saveBonusCode,
   getBonusCode,  getAllSessions,
   getAdminSession,
