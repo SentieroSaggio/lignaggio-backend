@@ -1030,6 +1030,78 @@ app.post('/api/save-email', (req, res) => {
   }
 });
 
+// ── POST /api/confirm-payment ───────────────────────────────────────────────────
+// Safety net for a webhook that never arrives.
+//
+// The Stripe webhook stays the primary path and nothing about it changes. But a
+// misconfigured or delayed webhook used to leave a paying customer staring at
+// placeholder text forever: the session was never marked paid, so the reading
+// and the PDF were never generated.
+//
+// The browser cannot be trusted to declare a payment successful, so this asks
+// Stripe directly. Only a PaymentIntent that Stripe itself reports as
+// 'succeeded', and whose metadata points at this very calculation, unlocks
+// anything. Everything it triggers is idempotent, so it is safe to call
+// alongside the webhook.
+app.post('/api/confirm-payment', async (req, res) => {
+  const { calculation_id, payment_intent_id } = req.body || {};
+
+  if (!calculation_id || !String(calculation_id).trim()) {
+    return res.status(400).json({ success: false, error: 'missing_calculation_id' });
+  }
+  const piId = String(payment_intent_id || '').trim();
+  if (!/^pi_[A-Za-z0-9_]{6,}$/.test(piId)) {
+    return res.status(400).json({ success: false, error: 'invalid_payment_intent_id' });
+  }
+
+  try {
+    const pi = await stripe.paymentIntents.retrieve(piId);
+
+    // The PaymentIntent must belong to this calculation. Without this check
+    // anyone could unlock a session by quoting somebody else's payment.
+    const piCalculationId = (pi.metadata && pi.metadata.calculation_id) || '';
+    if (piCalculationId !== String(calculation_id).trim()) {
+      console.warn('[confirm-payment] PaymentIntent', piId, 'does not belong to', calculation_id);
+      return res.status(403).json({ success: false, error: 'payment_calculation_mismatch' });
+    }
+
+    if (pi.status !== 'succeeded') {
+      console.log('[confirm-payment] PaymentIntent', piId, 'is', pi.status, '— not unlocking yet.');
+      return res.json({ success: true, paid: false, status: pi.status });
+    }
+
+    // Already unlocked by the webhook? Then there is nothing left to do.
+    const row = db.getSession(calculation_id);
+    const alreadyPaid = row && row.payment_status === 'paid';
+
+    if (!alreadyPaid) {
+      console.warn('[confirm-payment] Webhook never arrived for', calculation_id +
+                   ' — unlocking from a verified Stripe lookup instead.');
+      markResultAsPaid(calculation_id, (pi.metadata && pi.metadata.selected_price) || null);
+    }
+
+    // Generate only when there is no consultation yet: this call costs money.
+    let consultationExists = false;
+    try { consultationExists = Boolean(db.getConsultation(calculation_id)); } catch (_) {}
+
+    if (!consultationExists) {
+      generateFullConsultation(calculation_id).catch(function (err) {
+        console.error('[confirm-payment] generateFullConsultation error for',
+                      calculation_id, err.message);
+      });
+    }
+
+    // Idempotent on its own (claimPostback), so a webhook that shows up later
+    // cannot produce a second conversion.
+    dispatchKeitaroSale(pi);
+
+    return res.json({ success: true, paid: true, recovered: !alreadyPaid });
+  } catch (err) {
+    console.error('[confirm-payment] Stripe lookup failed for', piId, '—', err.message);
+    return res.status(502).json({ success: false, error: 'stripe_lookup_failed' });
+  }
+});
+
 // ── POST /api/generate-preview ──────────────────────────────────────────────────
 // Called during the analysis phase, BEFORE payment.
 // Creates the stored entry and generates a short 4-section teaser preview.
