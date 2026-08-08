@@ -13,6 +13,38 @@ const db = require('../db');
 // ── PDF generator ─────────────────────────────────────────────────────────
 const { generatePremiumPDF } = require('../services/pdfGenerator');
 
+/**
+ * In-flight PDF builds, keyed by calculation id.
+ *
+ * Two code paths want the same file: generateFullConsultation kicks the build
+ * off in the background, and GET /api/report builds it on demand when the file
+ * is missing. The success page polls that endpoint while the background build
+ * is still running, so both used to fire — launching Chromium twice for one
+ * order on the same small instance. That is pure waste and a likely source of
+ * the `spawn ETXTBSY` failures the generator retries around.
+ */
+const _pdfInFlight = new Map();
+
+/**
+ * Build the report PDF, reusing a build already running for this order.
+ * @param {string} calculationId
+ * @param {object} pdfData
+ * @returns {Promise<string>} path to the generated file
+ */
+function ensurePremiumPDF(calculationId, pdfData) {
+  const running = _pdfInFlight.get(calculationId);
+  if (running) {
+    console.log('[pdf] Build already in flight for', calculationId, '— joining it.');
+    return running;
+  }
+
+  const build = generatePremiumPDF(pdfData, calculationId)
+    .finally(function () { _pdfInFlight.delete(calculationId); });
+
+  _pdfInFlight.set(calculationId, build);
+  return build;
+}
+
 // ── Keitaro attribution (analytics side effect — never blocks a payment) ──
 const keitaro = require('../services/keitaro');
 
@@ -943,7 +975,7 @@ async function generateFullConsultation(calculationId) {
         compatibility: partnerData.compatibility,
         consultation:  parsed,
       };
-      generatePremiumPDF(pdfData, calculationId).then(function (pdfPath) {
+      ensurePremiumPDF(calculationId, pdfData).then(function (pdfPath) {
         console.log('[pdf] Premium PDF ready for:', calculationId, pdfPath);
         // Update DB pdf_url
         try {
@@ -1829,7 +1861,7 @@ app.get('/api/report/:calculation_id', function (req, res) {
       compatibility: compat,
       consultation,
     };
-    generatePremiumPDF(pdfData, calculationId).then(function () {
+    ensurePremiumPDF(calculationId, pdfData).then(function () {
       const download = String(req.query.download || '') === 'true';
       const p1 = row.partner1_name ? row.partner1_name.replace(/\s+/g, '-') : 'report';
       const p2 = row.partner2_name ? row.partner2_name.replace(/\s+/g, '-') : '';
