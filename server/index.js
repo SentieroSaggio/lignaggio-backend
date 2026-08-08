@@ -1646,6 +1646,117 @@ async function checkAbandonedSessions() {
 
 setInterval(checkAbandonedSessions, 5 * 60 * 1000); // every 5 minutes
 
+// =====================================================
+// DELIVERY RECONCILIATION — every paid order gets its reading
+// =====================================================
+/**
+ * Webhooks and the browser both fail sometimes: a webhook endpoint can be
+ * misconfigured, the customer can close the tab the instant they pay, OpenAI
+ * can error out mid-generation. Any of those used to end with somebody paying
+ * and receiving nothing.
+ *
+ * This sweep is the backstop. Stripe is the source of truth, so it asks Stripe
+ * what was actually paid and repairs anything the live path missed. Generation
+ * already emails the reading and builds the PDF, so a repaired order reaches
+ * the customer even if they never come back to the site.
+ */
+const RECONCILE_INTERVAL_MS   = 10 * 60 * 1000;   // sweep every 10 minutes
+const RECONCILE_FIRST_RUN_MS  = 60 * 1000;        // and shortly after boot
+const RECONCILE_WINDOW_MS     = 72 * 60 * 60 * 1000;
+const RECONCILE_MAX_PER_RUN   = 5;                // generation costs money
+const MAX_CONSULTATION_TRIES  = 5;
+
+let _reconcileRunning = false;
+
+/**
+ * Pass 1 — payments Stripe accepted that our database still calls pending.
+ * @returns {Promise<number>} how many orders were unlocked
+ */
+async function reconcileUnpaidButCharged() {
+  let unlocked = 0;
+
+  const list = await stripe.paymentIntents.list({
+    limit: 100,
+    created: { gte: Math.floor((Date.now() - RECONCILE_WINDOW_MS) / 1000) },
+  });
+
+  for (const pi of list.data) {
+    if (pi.status !== 'succeeded') { continue; }
+    if (pi.invoice) { continue; }                       // subscription renewal
+
+    const calculationId = (pi.metadata && pi.metadata.calculation_id) || '';
+    if (!calculationId) { continue; }                   // legacy quiz payment
+
+    let row = null;
+    try { row = db.getSession(calculationId); } catch (_) { continue; }
+    if (!row || row.payment_status === 'paid') { continue; }
+
+    console.warn('[reconcile] Order', calculationId, 'was paid in Stripe but still pending here —',
+                 'unlocking it now (payment', pi.id + ').');
+    markResultAsPaid(calculationId, (pi.metadata && pi.metadata.selected_price) || null);
+    dispatchKeitaroSale(pi);                            // idempotent
+    unlocked++;
+  }
+
+  return unlocked;
+}
+
+/**
+ * Pass 2 — orders marked paid that still have no consultation.
+ * @returns {Promise<number>} how many generations were started
+ */
+async function reconcileMissingConsultations() {
+  const pending = db.getOrdersMissingConsultation(
+    RECONCILE_WINDOW_MS, MAX_CONSULTATION_TRIES, RECONCILE_MAX_PER_RUN);
+
+  for (const order of pending) {
+    console.warn('[reconcile] Paid order', order.id, 'has no consultation —',
+                 'generating (attempt', (order.attempts + 1) + '/' + MAX_CONSULTATION_TRIES + ').');
+    // Count the attempt before starting: a crash mid-generation must not let
+    // this order retry indefinitely.
+    db.bumpConsultationAttempts(order.id);
+    try {
+      await generateFullConsultation(order.id);
+    } catch (err) {
+      console.error('[reconcile] Generation failed for', order.id, '—', err.message);
+    }
+  }
+
+  return pending.length;
+}
+
+async function reconcileDeliveries() {
+  if (_reconcileRunning) {
+    console.log('[reconcile] Previous sweep still running — skipping this tick.');
+    return;
+  }
+  _reconcileRunning = true;
+
+  try {
+    let unlocked = 0;
+    try {
+      unlocked = await reconcileUnpaidButCharged();
+    } catch (err) {
+      // A Stripe outage must not stop pass 2 from running.
+      console.error('[reconcile] Stripe scan failed:', err.message);
+    }
+
+    const generated = await reconcileMissingConsultations();
+
+    if (unlocked || generated) {
+      console.log('[reconcile] Sweep done — unlocked', unlocked, 'order(s), started',
+                  generated, 'generation(s).');
+    }
+  } catch (err) {
+    console.error('[reconcile] Sweep error:', err.message);
+  } finally {
+    _reconcileRunning = false;
+  }
+}
+
+setTimeout(reconcileDeliveries, RECONCILE_FIRST_RUN_MS);
+setInterval(reconcileDeliveries, RECONCILE_INTERVAL_MS);
+
 // ── GET /api/session/:calculationId — public session resume ──────────────────
 app.get('/api/session/:calculationId', function (req, res) {
   const calculationId = String(req.params.calculationId || '').trim();
@@ -1969,6 +2080,44 @@ app.delete('/api/admin/session/:id', adminAuth, function (req, res) {
 });
 
 // ── Bulk-delete sessions ───────────────────────────────────────────────────
+// ── POST /api/admin/reconcile — run the delivery sweep on demand ─────────────
+// The sweep runs by itself every 10 minutes; this is for when a specific
+// customer is waiting and you do not want to sit through the interval.
+app.post('/api/admin/reconcile', adminAuth, async function (req, res) {
+  const only = req.body && req.body.calculation_id
+    ? String(req.body.calculation_id).trim()
+    : '';
+
+  try {
+    if (only) {
+      const row = db.getSession(only);
+      if (!row) { return res.status(404).json({ success: false, error: 'session_not_found' }); }
+
+      let consultation = null;
+      try { consultation = db.getConsultation(only); } catch (_) {}
+      if (consultation) {
+        return res.json({ success: true, calculationId: only, action: 'already_delivered' });
+      }
+      if (row.payment_status !== 'paid') {
+        return res.json({ success: true, calculationId: only, action: 'not_paid',
+                          hint: 'Run without calculation_id to let the Stripe scan unlock it first.' });
+      }
+
+      db.bumpConsultationAttempts(only);
+      generateFullConsultation(only).catch(function (err) {
+        console.error('[admin/reconcile] Generation failed for', only, '—', err.message);
+      });
+      return res.json({ success: true, calculationId: only, action: 'generation_started' });
+    }
+
+    await reconcileDeliveries();
+    return res.json({ success: true, action: 'sweep_completed' });
+  } catch (err) {
+    console.error('[admin/reconcile] error:', err.message);
+    return res.status(500).json({ success: false, error: 'reconcile_failed' });
+  }
+});
+
 app.post('/api/admin/sessions/delete', adminAuth, function (req, res) {
   const ids = req.body && Array.isArray(req.body.ids) ? req.body.ids : [];
   if (!ids.length) { return res.status(400).json({ success: false, error: 'No ids provided' }); }

@@ -75,6 +75,9 @@ try { db.exec('ALTER TABLE sessions ADD COLUMN bonus_code TEXT'); } catch (_) {}
 try { db.exec('ALTER TABLE sessions ADD COLUMN quiz_context_json TEXT'); } catch (_) {}
 // Keitaro click id captured from ?subid= on the landing page.
 try { db.exec('ALTER TABLE sessions ADD COLUMN keitaro_subid TEXT'); } catch (_) {}
+// How many times the reconciler has tried to generate this consultation, so a
+// permanently failing order cannot retry forever and burn OpenAI credit.
+try { db.exec('ALTER TABLE sessions ADD COLUMN consultation_attempts INTEGER DEFAULT 0'); } catch (_) {}
 
 /**
  * One row per Stripe payment for which a Keitaro sale postback was attempted.
@@ -174,6 +177,33 @@ const stmtSaveSubid = db.prepare(`
 
 const stmtGetSubid = db.prepare(`
   SELECT keitaro_subid FROM sessions WHERE id = ?
+`);
+
+// ── Delivery reconciliation ──────────────────────────────────────────────────
+
+/**
+ * Paid orders that still have no consultation.
+ *
+ * This is the "customer paid but got nothing" query: if a row shows up here the
+ * reading was never generated, whatever the reason — missing webhook, an OpenAI
+ * failure, a restart mid-generation.
+ */
+const stmtOrdersMissingConsultation = db.prepare(`
+  SELECT s.id, s.created_at, COALESCE(s.consultation_attempts, 0) AS attempts
+    FROM sessions s
+    LEFT JOIN consultations c ON c.calculation_id = s.id
+   WHERE s.payment_status = 'paid'
+     AND c.id IS NULL
+     AND s.created_at > @cutoff
+     AND COALESCE(s.consultation_attempts, 0) < @maxAttempts
+   ORDER BY s.created_at ASC
+   LIMIT @limit
+`);
+
+const stmtBumpConsultationAttempts = db.prepare(`
+  UPDATE sessions
+     SET consultation_attempts = COALESCE(consultation_attempts, 0) + 1
+   WHERE id = ?
 `);
 
 /** Atomic claim: only the first caller for a payment_id inserts a row. */
@@ -384,6 +414,28 @@ function finishPostback(paymentId, outcome) {
  */
 function getPostback(paymentId) {
   return stmtGetPostback.get(paymentId) || null;
+}
+
+// ── Delivery reconciliation ──────────────────────────────────────────────────
+
+/**
+ * Orders that were paid for but never received a consultation.
+ * @param {number} windowMs   how far back to look
+ * @param {number} maxAttempts give up after this many tries
+ * @param {number} limit       cap per run — generation costs money
+ * @returns {Array<{id: string, created_at: number, attempts: number}>}
+ */
+function getOrdersMissingConsultation(windowMs, maxAttempts, limit) {
+  return stmtOrdersMissingConsultation.all({
+    cutoff: Date.now() - windowMs,
+    maxAttempts,
+    limit,
+  });
+}
+
+/** @param {string} calculationId */
+function bumpConsultationAttempts(calculationId) {
+  stmtBumpConsultationAttempts.run(calculationId);
 }
 
 /**
@@ -664,6 +716,8 @@ module.exports = {
   markAbandonedSent,
   saveSubid,
   getSubid,
+  getOrdersMissingConsultation,
+  bumpConsultationAttempts,
   claimPostback,
   finishPostback,
   getPostback,
