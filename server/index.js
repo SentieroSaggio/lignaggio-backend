@@ -1361,6 +1361,9 @@ app.get('/api/result', async (req, res) => {
 app.get('/health', function (req, res) {
   const stripeReady = Boolean(process.env.STRIPE_SECRET_KEY);
   const openaiReady = Boolean(process.env.OPENAI_API_KEY);
+  // Ad attribution is optional: false just means Keitaro tracking is switched
+  // off. Exposed here so the deployment can be verified without reading env.
+  const keitaroReady = Boolean(process.env.KEITARO_POSTBACK_URL);
 
   let dbReady = false;
   try {
@@ -1376,6 +1379,7 @@ app.get('/health', function (req, res) {
     stripe:   stripeReady,
     openai:   openaiReady,
     database: dbReady,
+    keitaro:  keitaroReady,
   });
 });
 
@@ -1981,5 +1985,6 @@ app.listen(PORT, () => {
   console.log('💳 Stripe ready —', process.env.STRIPE_SECRET_KEY ? '✅' : '❌ KEY MISSING');
   console.log('🤖 OpenAI ready —', process.env.OPENAI_API_KEY    ? '✅' : '⚠️  KEY MISSING');
   console.log('🔔 Webhook secret —', process.env.STRIPE_WEBHOOK_SECRET ? '✅' : '⚠️  KEY MISSING');
+  console.log('🎯 Keitaro postback —', process.env.KEITARO_POSTBACK_URL ? '✅ configured' : '➖ disabled (no KEITARO_POSTBACK_URL)');
   console.log('');
 });
