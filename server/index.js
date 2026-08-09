@@ -2219,6 +2219,19 @@ app.get('/api/admin/stats/realtime', adminAuth, function (req, res) {
   }
 });
 
+// ── GET /api/admin/stats/attribution — ad performance, measured by us ────────
+// So ad results can be checked without asking the traffic partner, and so a
+// sale that never reached Keitaro is visible rather than silently lost.
+app.get('/api/admin/stats/attribution', adminAuth, function (req, res) {
+  const days = Math.min(90, Math.max(1, parseInt(req.query.days, 10) || 30));
+  try {
+    res.json(db.getStatsAttribution(days * 24 * 60 * 60 * 1000));
+  } catch (err) {
+    console.error('[admin/stats/attribution]', err.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
 app.get('/api/admin/stats/revenue-breakdown', adminAuth, function (req, res) {
   try {
     const data = db.getStatsRevenueBreakdown();

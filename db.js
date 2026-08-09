@@ -556,6 +556,82 @@ function getAdminSession(id) {
 
 // ── Analytics stats ──────────────────────────────────────────────────────────
 
+/**
+ * Ad attribution, independent of whatever the traffic partner reports.
+ *
+ * Splits orders by whether a Keitaro click id was captured, and reports how
+ * many sale postbacks actually left the server. If the partner's dashboard and
+ * these numbers disagree, the gap is visible here rather than taken on trust.
+ *
+ * @param {number} windowMs how far back to count
+ * @returns {object}
+ */
+function getStatsAttribution(windowMs) {
+  const cutoff = Date.now() - windowMs;
+
+  const split = db.prepare(`
+    SELECT
+      SUM(CASE WHEN keitaro_subid IS NOT NULL AND keitaro_subid != '' THEN 1 ELSE 0 END) AS ad_visits,
+      SUM(CASE WHEN keitaro_subid IS NULL OR  keitaro_subid  = '' THEN 1 ELSE 0 END) AS organic_visits,
+      SUM(CASE WHEN payment_status = 'paid' AND keitaro_subid IS NOT NULL AND keitaro_subid != '' THEN 1 ELSE 0 END) AS ad_sales,
+      SUM(CASE WHEN payment_status = 'paid' AND (keitaro_subid IS NULL OR keitaro_subid = '') THEN 1 ELSE 0 END) AS organic_sales,
+      COALESCE(SUM(CASE WHEN payment_status = 'paid' AND keitaro_subid IS NOT NULL AND keitaro_subid != ''
+                        AND selected_price IS NOT NULL THEN CAST(selected_price AS REAL) ELSE 0 END), 0) AS ad_revenue,
+      COALESCE(SUM(CASE WHEN payment_status = 'paid' AND (keitaro_subid IS NULL OR keitaro_subid = '')
+                        AND selected_price IS NOT NULL THEN CAST(selected_price AS REAL) ELSE 0 END), 0) AS organic_revenue
+    FROM sessions
+    WHERE created_at >= ?
+  `).get(cutoff);
+
+  // Delivery health: a sale that never reached Keitaro is unpaid commission
+  // or a missing conversion, and only this table knows about it.
+  const postbacks = db.prepare(`
+    SELECT postback_status AS status, COUNT(*) AS count
+      FROM keitaro_postbacks
+     WHERE created_at >= ?
+     GROUP BY postback_status
+  `).all(cutoff);
+
+  const recent = db.prepare(`
+    SELECT p.payment_id, p.subid, p.postback_status, p.http_status, p.attempts, p.created_at,
+           s.selected_price
+      FROM keitaro_postbacks p
+      LEFT JOIN sessions s ON s.keitaro_subid = p.subid
+     WHERE p.created_at >= ?
+     ORDER BY p.created_at DESC
+     LIMIT 20
+  `).all(cutoff);
+
+  const byStatus = {};
+  postbacks.forEach(function (r) { byStatus[r.status] = r.count; });
+
+  const adVisits = split.ad_visits || 0;
+  const orgVisits = split.organic_visits || 0;
+
+  return {
+    windowMs,
+    ads: {
+      visits:  adVisits,
+      sales:   split.ad_sales || 0,
+      revenue: Number((split.ad_revenue || 0).toFixed(2)),
+      conversionRate: adVisits ? Number(((split.ad_sales || 0) / adVisits * 100).toFixed(2)) : 0,
+    },
+    organic: {
+      visits:  orgVisits,
+      sales:   split.organic_sales || 0,
+      revenue: Number((split.organic_revenue || 0).toFixed(2)),
+      conversionRate: orgVisits ? Number(((split.organic_sales || 0) / orgVisits * 100).toFixed(2)) : 0,
+    },
+    postbacks: {
+      sent:     byStatus.sent     || 0,
+      failed:   byStatus.failed   || 0,
+      rejected: byStatus.rejected || 0,
+      pending:  byStatus.pending  || 0,
+    },
+    recent,
+  };
+}
+
 function getStatsOverview() {
   const now      = Date.now();
   const dayStart = now - (now % 86400000);          // midnight UTC today
@@ -716,6 +792,7 @@ module.exports = {
   markAbandonedSent,
   saveSubid,
   getSubid,
+  getStatsAttribution,
   getOrdersMissingConsultation,
   bumpConsultationAttempts,
   claimPostback,
