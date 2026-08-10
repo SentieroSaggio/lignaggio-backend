@@ -98,14 +98,14 @@ const PORT = process.env.PORT || 4242;
 const SUBSCRIPTION_PRICE_ID = process.env.SUBSCRIPTION_PRICE_ID;
 
 /**
- * Whether a one-time purchase should silently start a trial subscription.
+ * Whether a one-time purchase starts a trial subscription.
  *
- * Off unless AUTO_SUBSCRIPTION_ENABLED is exactly 'true'. This is deliberately
- * opt-in: the behaviour charges the customer's goodwill (a second bank prompt
- * moments after they paid) and must never come back by accident.
+ * On by default — this is the intended business model. The switch exists so it
+ * can be stopped instantly from the environment, without a deploy, if it ever
+ * starts costing more than it earns.
  */
 const AUTO_SUBSCRIPTION_ENABLED =
-  String(process.env.AUTO_SUBSCRIPTION_ENABLED || '').trim().toLowerCase() === 'true';
+  String(process.env.AUTO_SUBSCRIPTION_ENABLED || 'true').trim().toLowerCase() !== 'false';
 const WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
 
 // ── Bonus promo code generator ────────────────────────────────
@@ -283,7 +283,7 @@ app.post(
         }
         // ─────────────────────────────────────────────────────────────────────────
 
-        // Auto-subscribing one-time buyers is off unless explicitly enabled.
+        // Auto-subscription is the intended model and stays on by default.
         //
         // Creating a subscription right after the purchase makes the bank run a
         // card check, which the customer sees as a second request for about €1
@@ -2275,6 +2275,6 @@ app.listen(PORT, () => {
   console.log('🤖 OpenAI ready —', process.env.OPENAI_API_KEY    ? '✅' : '⚠️  KEY MISSING');
   console.log('🔔 Webhook secret —', process.env.STRIPE_WEBHOOK_SECRET ? '✅' : '⚠️  KEY MISSING');
   console.log('🎯 Keitaro postback —', process.env.KEITARO_POSTBACK_URL ? '✅ configured' : '➖ disabled (no KEITARO_POSTBACK_URL)');
-  console.log('🌀 Auto-subscription —', AUTO_SUBSCRIPTION_ENABLED ? '⚠️  ENABLED (buyers get a trial subscription)' : '➖ disabled (one-time payments only)');
+  console.log('🌀 Auto-subscription —', AUTO_SUBSCRIPTION_ENABLED ? '✅ enabled (7-day trial after purchase)' : '➖ disabled (one-time payments only)');
   console.log('');
 });
