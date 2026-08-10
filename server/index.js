@@ -96,6 +96,16 @@ const generatedResults = {};
 
 const PORT = process.env.PORT || 4242;
 const SUBSCRIPTION_PRICE_ID = process.env.SUBSCRIPTION_PRICE_ID;
+
+/**
+ * Whether a one-time purchase should silently start a trial subscription.
+ *
+ * Off unless AUTO_SUBSCRIPTION_ENABLED is exactly 'true'. This is deliberately
+ * opt-in: the behaviour charges the customer's goodwill (a second bank prompt
+ * moments after they paid) and must never come back by accident.
+ */
+const AUTO_SUBSCRIPTION_ENABLED =
+  String(process.env.AUTO_SUBSCRIPTION_ENABLED || '').trim().toLowerCase() === 'true';
 const WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
 
 // ── Bonus promo code generator ────────────────────────────────
@@ -272,6 +282,19 @@ app.post(
           });
         }
         // ─────────────────────────────────────────────────────────────────────────
+
+        // Auto-subscribing one-time buyers is off unless explicitly enabled.
+        //
+        // Creating a subscription right after the purchase makes the bank run a
+        // card check, which the customer sees as a second request for about €1
+        // seconds after paying — several banks decline it outright. Turning this
+        // off changes nothing about the subscription product itself: the €19
+        // price key and POST /create-subscription keep working, so subscriptions
+        // can still be sold deliberately.
+        if (!AUTO_SUBSCRIPTION_ENABLED) {
+          console.log('ℹ️ Auto-subscription disabled — one-time payment only for', paymentIntent.id);
+          break;
+        }
 
         if (!SUBSCRIPTION_PRICE_ID) {
           console.warn('⚠️ SUBSCRIPTION_PRICE_ID is not set, skip subscription creation');
@@ -2252,5 +2275,6 @@ app.listen(PORT, () => {
   console.log('🤖 OpenAI ready —', process.env.OPENAI_API_KEY    ? '✅' : '⚠️  KEY MISSING');
   console.log('🔔 Webhook secret —', process.env.STRIPE_WEBHOOK_SECRET ? '✅' : '⚠️  KEY MISSING');
   console.log('🎯 Keitaro postback —', process.env.KEITARO_POSTBACK_URL ? '✅ configured' : '➖ disabled (no KEITARO_POSTBACK_URL)');
+  console.log('🌀 Auto-subscription —', AUTO_SUBSCRIPTION_ENABLED ? '⚠️  ENABLED (buyers get a trial subscription)' : '➖ disabled (one-time payments only)');
   console.log('');
 });
