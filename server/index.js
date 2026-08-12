@@ -48,6 +48,9 @@ function ensurePremiumPDF(calculationId, pdfData) {
 // ── Keitaro attribution (analytics side effect — never blocks a payment) ──
 const keitaro = require('../services/keitaro');
 
+// ── Google Analytics 4 reporting (read-only, admin panel only) ────────────
+const googleAnalytics = require('../services/googleAnalytics');
+
 // -----------------------------------------------------
 // Конфиг цен (price_id берём из переменных окружения)
 // -----------------------------------------------------
@@ -2255,6 +2258,20 @@ app.get('/api/admin/stats/attribution', adminAuth, function (req, res) {
   }
 });
 
+// ── GET /api/admin/stats/google — GA4 numbers for the quiz only ─────────────
+// Reads Google Analytics from our own panel so the owner does not have to open
+// the GA interface. GA problems are returned as data, never as a 500, because
+// the rest of the dashboard must keep working when Google is unavailable.
+app.get('/api/admin/stats/google', adminAuth, async function (req, res) {
+  const days = Math.min(365, Math.max(1, parseInt(req.query.days, 10) || 30));
+  try {
+    res.json(await googleAnalytics.getQuizReport({ days }));
+  } catch (err) {
+    console.error('[admin/stats/google]', err.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
 app.get('/api/admin/stats/revenue-breakdown', adminAuth, function (req, res) {
   try {
     const data = db.getStatsRevenueBreakdown();
@@ -2276,5 +2293,6 @@ app.listen(PORT, () => {
   console.log('🔔 Webhook secret —', process.env.STRIPE_WEBHOOK_SECRET ? '✅' : '⚠️  KEY MISSING');
   console.log('🎯 Keitaro postback —', process.env.KEITARO_POSTBACK_URL ? '✅ configured' : '➖ disabled (no KEITARO_POSTBACK_URL)');
   console.log('🌀 Auto-subscription —', AUTO_SUBSCRIPTION_ENABLED ? '✅ enabled (7-day trial after purchase)' : '➖ disabled (one-time payments only)');
+  console.log('📊 Google Analytics —', googleAnalytics.isConfigured() ? '✅ configured' : '➖ disabled (no GA_PROPERTY_ID / GOOGLE_APPLICATION_CREDENTIALS_JSON)');
   console.log('');
 });
