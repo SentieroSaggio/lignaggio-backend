@@ -489,11 +489,15 @@ const stmtGetAllSessions = db.prepare(`
     s.compatibility_json,
     s.bonus_code,
     s.created_at,
-    se.email,
-    CASE WHEN c.id IS NOT NULL THEN 1 ELSE 0 END AS consultation_ready
+    MAX(se.email) AS email,
+    MAX(CASE WHEN c.id IS NOT NULL THEN 1 ELSE 0 END) AS consultation_ready
   FROM sessions s
   LEFT JOIN session_emails se ON se.calculation_id = s.id
   LEFT JOIN consultations c  ON c.calculation_id  = s.id
+  -- Without this, a session carrying two emails or two consultations came back
+  -- as two rows: the list showed it twice and the header counted it twice. The
+  -- stats queries use COUNT(DISTINCT), which is why the two disagreed.
+  GROUP BY s.id
   ORDER BY s.created_at DESC
 `);
 
