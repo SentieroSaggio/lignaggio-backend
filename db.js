@@ -96,6 +96,22 @@ db.exec(`
     sent_at         INTEGER,
     created_at      INTEGER
   );
+
+  -- Page opens, counted per day and per page.
+  --
+  -- A session row is only created once someone finishes the quiz and reaches
+  -- the preview, so everyone who opened the site and left was invisible to the
+  -- panel. This table closes that gap.
+  --
+  -- It holds counters and nothing else: no IP, no user agent, no cookie, no
+  -- identifier of any kind, so there is nobody to identify in it and it needs
+  -- no cookie consent to be collected.
+  CREATE TABLE IF NOT EXISTS visit_counts (
+    day   INTEGER NOT NULL,
+    page  TEXT    NOT NULL,
+    count INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (day, page)
+  );
 `);
 // Normalize timestamps stored as Unix seconds → milliseconds
 // Any value < 10 billion is seconds-based (covers all dates up to ~2286 in seconds)
@@ -705,7 +721,12 @@ function getStatsOverview() {
   const emailCapture   = counts.total    > 0 ? ((previews.total     / counts.total)    * 100).toFixed(1) : '0.0';
   const aov            = counts.paid_total > 0 ? (counts.rev_total / counts.paid_total).toFixed(2) : '0.00';
 
+  // `visitors` counts quiz sessions, which only exist once someone reaches the
+  // preview. `visits` counts page opens, which is the larger, earlier number.
+  const visits = getVisitStats();
+
   return {
+    visits,
     visitors:         { today: counts.today,      week: counts.week,      total: counts.total },
     payments:         { today: counts.paid_today, week: counts.paid_week, month: counts.paid_month, total: counts.paid_total },
     conversion:       { today: crToday, week: crWeek },
@@ -717,6 +738,67 @@ function getStatsOverview() {
     hourly,
     weekly,
     funnel_timeline:  funnelTimeline,
+  };
+}
+
+/** Page names we count separately; anything else is folded into 'altro'. */
+const KNOWN_PAGES = new Set([
+  'index', 'partner1', 'partner2', 'question', 'analysis', 'offer',
+  'result', 'cookie', 'privacy', 'terms',
+]);
+
+const stmtRecordVisit = db.prepare(`
+  INSERT INTO visit_counts (day, page, count) VALUES (@day, @page, 1)
+  ON CONFLICT(day, page) DO UPDATE SET count = count + 1
+`);
+
+/**
+ * Count one page open.
+ *
+ * Treats the page name as untrusted: only known names are stored, everything
+ * else becomes 'altro', so nothing arbitrary can reach the table.
+ *
+ * @param {string} page
+ */
+function recordVisit(page) {
+  const name = String(page || '').trim().toLowerCase();
+  const now  = Date.now();
+  stmtRecordVisit.run({
+    day:  now - (now % 86400000),          // midnight UTC
+    page: KNOWN_PAGES.has(name) ? name : 'altro',
+  });
+}
+
+/**
+ * Page opens for the panel: today, this week, all time, plus a per-page split.
+ * @returns {{today: number, week: number, total: number, by_page: Array}}
+ */
+function getVisitStats() {
+  const now      = Date.now();
+  const dayStart = now - (now % 86400000);
+  const weekAgo  = now - 7 * 86400000;
+
+  const totals = db.prepare(`
+    SELECT
+      COALESCE(SUM(CASE WHEN day >= ? THEN count ELSE 0 END), 0) AS today,
+      COALESCE(SUM(CASE WHEN day >= ? THEN count ELSE 0 END), 0) AS week,
+      COALESCE(SUM(count), 0)                                    AS total
+    FROM visit_counts
+  `).get(dayStart, weekAgo);
+
+  const byPage = db.prepare(`
+    SELECT page, SUM(count) AS count
+    FROM visit_counts
+    WHERE day >= ?
+    GROUP BY page
+    ORDER BY count DESC
+  `).all(weekAgo);
+
+  return {
+    today:   totals.today || 0,
+    week:    totals.week  || 0,
+    total:   totals.total || 0,
+    by_page: byPage,
   };
 }
 
@@ -806,6 +888,8 @@ module.exports = {
   getBonusCode,  getAllSessions,
   getAdminSession,
   deleteSession,
+  recordVisit,
+  getVisitStats,
   getStatsOverview,
   getStatsFunnel,
   getStatsRealtime,

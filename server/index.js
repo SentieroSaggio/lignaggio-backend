@@ -386,6 +386,27 @@ app.get('/config', (req, res) => {
   res.json({ publishableKey });
 });
 
+// =====================================================
+// POST /api/track/visit — count one page open
+// =====================================================
+// A session row is only created once someone finishes the quiz, so until now
+// everyone who opened the site and left was invisible in the admin panel.
+//
+// This endpoint increments a per-day counter and stores nothing else: no IP,
+// no user agent, no cookie, no identifier. There is nobody to identify in the
+// table, which is why the count does not wait for cookie consent.
+//
+// It answers 204 no matter what: a tracking call must never surface an error
+// on the quiz, and must never tell a caller whether anything was recorded.
+app.post('/api/track/visit', function (req, res) {
+  try {
+    db.recordVisit((req.query && req.query.page) || (req.body && req.body.page));
+  } catch (err) {
+    console.error('[track/visit]', err.message);
+  }
+  res.status(204).end();
+});
+
 // -----------------------------------------------------
 // Helper: берём сумму и валюту из Stripe Price
 // -----------------------------------------------------
