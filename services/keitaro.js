@@ -106,7 +106,7 @@ async function sendSalePostback(params) {
   }
 
   // URLSearchParams percent-encodes every value, so nothing can break out of
-  // the form body regardless of what reached us.
+  // the query string or the form body regardless of what reached us.
   const body = new URLSearchParams({
     subid,
     status:   'sale',
@@ -115,20 +115,50 @@ async function sendSalePostback(params) {
     currency: String(params.currency || 'eur').toUpperCase(),
   }).toString();
 
+  // Keitaro documents the S2S postback as a GET with the parameters in the URL.
+  // We were sending a form POST, which the tracker answered with HTTP 500 — the
+  // sale was confirmed by Stripe but never reached the partner. GET is the
+  // primary call now; POST stays as a fallback for a non-standard endpoint.
+  const target = url + (url.indexOf('?') === -1 ? '?' : '&') + body;
+
+  /**
+   * One delivery attempt. Never throws — the caller decides about retries.
+   * @param {'GET'|'POST'} method
+   * @returns {Promise<{res: object|null, reason: string|null}>}
+   */
+  async function deliver(method) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    try {
+      const res = await fetch(method === 'GET' ? target : url, {
+        method,
+        headers: method === 'GET' ? {} : { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: method === 'GET' ? undefined : body,
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+      return { res, reason: null };
+    } catch (err) {
+      clearTimeout(timer);
+      const reason = err && err.name === 'AbortError' ? 'timeout' : (err && err.message) || 'unknown';
+      return { res: null, reason };
+    }
+  }
+
   let lastStatus = null;
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-
     try {
-      const res = await fetch(url, {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body,
-        signal:  controller.signal,
-      });
-      clearTimeout(timer);
+      let { res, reason } = await deliver('GET');
+
+      // An endpoint that only accepts a form POST says so with 404/405. Trying
+      // the other shape once costs one request and covers both conventions.
+      if (res && (res.status === 404 || res.status === 405)) {
+        const fallback = await deliver('POST');
+        if (fallback.res) { res = fallback.res; reason = null; }
+      }
+
+      if (!res) { throw new Error(reason || 'unknown'); }
       lastStatus = res.status;
 
       if (res.ok) {
@@ -147,10 +177,11 @@ async function sendSalePostback(params) {
       console.warn('[keitaro] Postback failed for payment', paymentId,
                    '— HTTP', res.status, '(attempt', attempt + '/' + MAX_ATTEMPTS + ')');
     } catch (err) {
-      clearTimeout(timer);
-      const reason = err && err.name === 'AbortError' ? 'timeout' : (err && err.message) || 'unknown';
+      // deliver() owns its own timer and never throws; anything arriving here is
+      // the network failure it reported, re-thrown above.
       console.warn('[keitaro] Postback error for payment', paymentId,
-                   '—', reason, '(attempt', attempt + '/' + MAX_ATTEMPTS + ')');
+                   '—', (err && err.message) || 'unknown',
+                   '(attempt', attempt + '/' + MAX_ATTEMPTS + ')');
     }
 
     if (attempt < MAX_ATTEMPTS) {
