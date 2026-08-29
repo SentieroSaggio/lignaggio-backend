@@ -47,6 +47,8 @@ function ensurePremiumPDF(calculationId, pdfData) {
 
 // ── Keitaro attribution (analytics side effect — never blocks a payment) ──
 const keitaro = require('../services/keitaro');
+// Our own ?src= campaign labels - deliberately outside the Keitaro channel.
+const traffic = require('../services/traffic');
 
 // ── Google Analytics 4 reporting (read-only, admin panel only) ────────────
 const googleAnalytics = require('../services/googleAnalytics');
@@ -400,7 +402,13 @@ app.get('/config', (req, res) => {
 // on the quiz, and must never tell a caller whether anything was recorded.
 app.post('/api/track/visit', function (req, res) {
   try {
-    db.recordVisit((req.query && req.query.page) || (req.body && req.body.page));
+    db.recordVisit(
+      (req.query && req.query.page) || (req.body && req.body.page),
+      // Our own campaign label, present only on the arrival that carried it
+      // in the URL - see public/google-tag.js for why it is never read back
+      // from storage. db.recordVisit validates it and drops the unexpected.
+      (req.query && req.query.src)  || (req.body && req.body.src)
+    );
   } catch (err) {
     console.error('[track/visit]', err.message);
   }
@@ -528,7 +536,7 @@ function markResultAsPaid(calculationId) {
 app.post('/create-payment-intent', async (req, res) => {
   try {
     // Old quiz fields + new compatibility quiz optional fields (calculation_id, compatibility_score, priceId)
-    const { name, email, arch, archetype, price, calculation_id, compatibility_score, priceId, subid } = req.body || {};
+    const { name, email, arch, archetype, price, calculation_id, compatibility_score, priceId, subid, src } = req.body || {};
 
     if (!email) {
       return res.status(400).json({ error: 'Missing email' });
@@ -572,6 +580,18 @@ app.post('/create-payment-intent', async (req, res) => {
       // Backfill so the webhook can still resolve it from the DB.
       if (attributionSubid && calculation_id) {
         try { db.saveSubid(calculation_id, attributionSubid); } catch (_) {}
+      }
+    }
+
+    // -- Our own campaign label ------------------------------------------
+    // Backfill only: it is not sent to Stripe and not reported to anyone.
+    // The sale is attributed later by reading sessions.traffic_src, so a
+    // label that never made it into the session at preview time still counts
+    // if the browser is carrying one now.
+    if (calculation_id) {
+      const cleanSrc = traffic.sanitizeSource(src);
+      if (cleanSrc) {
+        try { db.saveTrafficSrc(calculation_id, cleanSrc); } catch (_) {}
       }
     }
 
@@ -1185,7 +1205,7 @@ app.post('/api/confirm-payment', async (req, res) => {
 // Called during the analysis phase, BEFORE payment.
 // Creates the stored entry and generates a short 4-section teaser preview.
 app.post('/api/generate-preview', async (req, res) => {
-  const { calculation_id, partner1, partner2, compatibility, quizContext, subid } = req.body || {};
+  const { calculation_id, partner1, partner2, compatibility, quizContext, subid, src } = req.body || {};
 
   if (!calculation_id || !String(calculation_id).trim()) {
     return res.status(400).json({ success: false, error: 'missing_calculation_id' });
@@ -1239,6 +1259,19 @@ app.post('/api/generate-preview', async (req, res) => {
       console.log('[generate-preview] Click id attached to', calculation_id);
     } catch (dbErr) {
       console.error('[generate-preview] Could not store click id:', dbErr.message);
+    }
+  }
+
+  // -- Our own campaign label ----------------------------------------------
+  // Same treatment, separate column: this one identifies the reel or post the
+  // visitor came from and is only ever read back by our own admin panel.
+  const cleanSrc = traffic.sanitizeSource(src);
+  if (cleanSrc) {
+    try {
+      db.saveTrafficSrc(calculation_id, cleanSrc);
+      console.log('[generate-preview] Campaign label', cleanSrc, 'attached to', calculation_id);
+    } catch (dbErr) {
+      console.error('[generate-preview] Could not store campaign label:', dbErr.message);
     }
   }
 
@@ -2289,6 +2322,20 @@ app.get('/api/admin/stats/google', adminAuth, async function (req, res) {
     res.json(await googleAnalytics.getQuizReport({ days }));
   } catch (err) {
     console.error('[admin/stats/google]', err.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+// -- GET /api/admin/stats/sources - our own labelled traffic, per campaign --
+// One row per ?src= label: clicks on arrival, quizzes finished, sales,
+// revenue. Independent of cookie consent, of ad blockers and of the
+// partner's tracker, which is what makes it worth showing a partner.
+app.get('/api/admin/stats/sources', adminAuth, function (req, res) {
+  const days = Math.min(365, Math.max(1, parseInt(req.query.days, 10) || 30));
+  try {
+    res.json(db.getStatsSources(days * 24 * 60 * 60 * 1000));
+  } catch (err) {
+    console.error('[admin/stats/sources]', err.message);
     res.status(500).json({ error: 'server_error' });
   }
 });

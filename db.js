@@ -10,6 +10,7 @@ const path     = require('path');
 const fs       = require('fs');
 const crypto   = require('crypto');
 const Database = require('better-sqlite3');
+const traffic  = require('./services/traffic');
 
 // ── Ensure database directory exists ────────────────────────────────────────
 // On Render: set DB_PATH env var to a path on the persistent disk, e.g.:
@@ -75,6 +76,9 @@ try { db.exec('ALTER TABLE sessions ADD COLUMN bonus_code TEXT'); } catch (_) {}
 try { db.exec('ALTER TABLE sessions ADD COLUMN quiz_context_json TEXT'); } catch (_) {}
 // Keitaro click id captured from ?subid= on the landing page.
 try { db.exec('ALTER TABLE sessions ADD COLUMN keitaro_subid TEXT'); } catch (_) {}
+// Our own campaign label captured from ?src= on the landing page - which
+// reel, story or post this quiz came from. Independent of the click id above.
+try { db.exec('ALTER TABLE sessions ADD COLUMN traffic_src TEXT'); } catch (_) {}
 // How many times the reconciler has tried to generate this consultation, so a
 // permanently failing order cannot retry forever and burn OpenAI credit.
 try { db.exec('ALTER TABLE sessions ADD COLUMN consultation_attempts INTEGER DEFAULT 0'); } catch (_) {}
@@ -111,6 +115,24 @@ db.exec(`
     page  TEXT    NOT NULL,
     count INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (day, page)
+  );
+
+  -- The same page opens, but only the ones that arrived with our own ?src=
+  -- label, split by that label.
+  --
+  -- A separate table rather than a column on visit_counts: that table's
+  -- primary key is (day, page) and widening it would mean rebuilding it and
+  -- rewriting every historical row. Here labelled traffic is counted a
+  -- second time, on its own, and visit_counts stays exactly as it was.
+  --
+  -- Same privacy position as visit_counts: counters and a label we chose
+  -- ourselves, no IP, no user agent, no cookie, nobody to identify.
+  CREATE TABLE IF NOT EXISTS visit_sources (
+    day    INTEGER NOT NULL,
+    page   TEXT    NOT NULL,
+    source TEXT    NOT NULL,
+    count  INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (day, page, source)
   );
 `);
 // Normalize timestamps stored as Unix seconds → milliseconds
@@ -193,6 +215,19 @@ const stmtSaveSubid = db.prepare(`
 
 const stmtGetSubid = db.prepare(`
   SELECT keitaro_subid FROM sessions WHERE id = ?
+`);
+
+// -- Our own campaign label --------------------------------------------------
+// Same first-wins rule as the click id: a visitor who wanders back in through
+// a second link mid-funnel must not rewrite the source of a started quiz.
+
+const stmtSaveTrafficSrc = db.prepare(`
+  UPDATE sessions SET traffic_src = @src
+   WHERE id = @id AND (traffic_src IS NULL OR traffic_src = '')
+`);
+
+const stmtGetTrafficSrc = db.prepare(`
+  SELECT traffic_src FROM sessions WHERE id = ?
 `);
 
 // ── Delivery reconciliation ──────────────────────────────────────────────────
@@ -390,6 +425,27 @@ function getSubid(calculationId) {
   if (!calculationId) { return ''; }
   const row = stmtGetSubid.get(calculationId);
   return (row && row.keitaro_subid) || '';
+}
+
+/**
+ * Attach our own campaign label to a session. First write wins, for the same
+ * reason as the click id above.
+ * @param {string} calculationId
+ * @param {string} src  already sanitized by the caller
+ */
+function saveTrafficSrc(calculationId, src) {
+  if (!calculationId || !src) { return; }
+  stmtSaveTrafficSrc.run({ id: calculationId, src });
+}
+
+/**
+ * @param {string} calculationId
+ * @returns {string} stored campaign label, '' when none
+ */
+function getTrafficSrc(calculationId) {
+  if (!calculationId) { return ''; }
+  const row = stmtGetTrafficSrc.get(calculationId);
+  return (row && row.traffic_src) || '';
 }
 
 /**
@@ -652,6 +708,90 @@ function getStatsAttribution(windowMs) {
   };
 }
 
+/**
+ * Performance of our own labelled traffic, one row per ?src= label.
+ *
+ * This is the number to show a partner for a reel or a post: clicks measured
+ * on arrival, sales measured at payment, both by us, neither depending on
+ * cookie consent, an ad blocker, or the partner's tracker.
+ *
+ * Two populations that must not be confused, and the panel labels them apart:
+ *   clicks   - arrivals on a link carrying the label (visit_sources)
+ *   quizzes  - of those, the ones who finished and reached the preview
+ *
+ * Only sessions started inside the window are counted, but clicks are
+ * bucketed per UTC day, so the click window is rounded outwards to the whole
+ * day the cutoff falls in - half a day of clicks silently dropped would
+ * understate the conversion rate of the newest campaign, the one being judged.
+ *
+ * @param {number} windowMs how far back to count
+ * @returns {{windowMs: number, sources: Array, totals: object}}
+ */
+function getStatsSources(windowMs) {
+  const cutoff    = Date.now() - windowMs;
+  const cutoffDay = cutoff - (cutoff % 86400000);
+
+  const clicks = db.prepare(`
+    SELECT source, SUM(count) AS clicks
+      FROM visit_sources
+     WHERE day >= ?
+     GROUP BY source
+  `).all(cutoffDay);
+
+  const funnel = db.prepare(`
+    SELECT
+      traffic_src AS source,
+      COUNT(*) AS quizzes,
+      SUM(CASE WHEN payment_status = 'paid' THEN 1 ELSE 0 END) AS sales,
+      COALESCE(SUM(CASE WHEN payment_status = 'paid' AND selected_price IS NOT NULL
+                        THEN CAST(selected_price AS REAL) ELSE 0 END), 0) AS revenue
+      FROM sessions
+     WHERE created_at >= ? AND traffic_src IS NOT NULL AND traffic_src != ''
+     GROUP BY traffic_src
+  `).all(cutoff);
+
+  // A label can appear on one side only - clicks with no sale yet, or a sale
+  // whose clicks fell outside the window - so both sides are merged rather
+  // than joined, and a missing side reads as zero instead of dropping the row.
+  const bySource = new Map();
+  const rowFor = function (name) {
+    if (!bySource.has(name)) {
+      bySource.set(name, { source: name, clicks: 0, quizzes: 0, sales: 0, revenue: 0 });
+    }
+    return bySource.get(name);
+  };
+
+  clicks.forEach(function (r) { rowFor(r.source).clicks = r.clicks || 0; });
+  funnel.forEach(function (r) {
+    const row = rowFor(r.source);
+    row.quizzes = r.quizzes || 0;
+    row.sales   = r.sales   || 0;
+    row.revenue = Number((r.revenue || 0).toFixed(2));
+  });
+
+  const sources = Array.from(bySource.values()).map(function (row) {
+    return Object.assign({}, row, {
+      // Against clicks, not quizzes: the honest question is what share of the
+      // people who tapped the link ended up paying.
+      conversionRate: row.clicks ? Number((row.sales / row.clicks * 100).toFixed(2)) : 0,
+      quizRate:       row.clicks ? Number((row.quizzes / row.clicks * 100).toFixed(2)) : 0,
+    });
+  }).sort(function (a, b) {
+    return (b.revenue - a.revenue) || (b.clicks - a.clicks) || a.source.localeCompare(b.source);
+  });
+
+  const totals = sources.reduce(function (acc, row) {
+    acc.clicks  += row.clicks;
+    acc.quizzes += row.quizzes;
+    acc.sales   += row.sales;
+    acc.revenue += row.revenue;
+    return acc;
+  }, { clicks: 0, quizzes: 0, sales: 0, revenue: 0 });
+  totals.revenue = Number(totals.revenue.toFixed(2));
+
+  return { windowMs, sources, totals };
+}
+
 function getStatsOverview() {
   const now      = Date.now();
   const dayStart = now - (now % 86400000);          // midnight UTC today
@@ -752,21 +892,34 @@ const stmtRecordVisit = db.prepare(`
   ON CONFLICT(day, page) DO UPDATE SET count = count + 1
 `);
 
+const stmtRecordVisitSource = db.prepare(`
+  INSERT INTO visit_sources (day, page, source, count) VALUES (@day, @page, @source, 1)
+  ON CONFLICT(day, page, source) DO UPDATE SET count = count + 1
+`);
+
 /**
- * Count one page open.
+ * Count one page open, and - when the visit arrived with one of our own
+ * labels - count it a second time against that label.
  *
- * Treats the page name as untrusted: only known names are stored, everything
- * else becomes 'altro', so nothing arbitrary can reach the table.
+ * Treats both values as untrusted: only known page names are stored,
+ * everything else becomes 'altro', and a label that does not match the agreed
+ * shape is dropped rather than written, so nothing arbitrary reaches a table.
  *
  * @param {string} page
+ * @param {string} [source] our ?src= label, absent for unlabelled traffic
  */
-function recordVisit(page) {
+function recordVisit(page, source) {
   const name = String(page || '').trim().toLowerCase();
   const now  = Date.now();
-  stmtRecordVisit.run({
-    day:  now - (now % 86400000),          // midnight UTC
-    page: KNOWN_PAGES.has(name) ? name : 'altro',
-  });
+  const day  = now - (now % 86400000);          // midnight UTC
+  const safePage = KNOWN_PAGES.has(name) ? name : 'altro';
+
+  stmtRecordVisit.run({ day, page: safePage });
+
+  const label = traffic.sanitizeSource(source);
+  if (label) {
+    stmtRecordVisitSource.run({ day, page: safePage, source: label });
+  }
 }
 
 /**
@@ -879,6 +1032,9 @@ module.exports = {
   saveSubid,
   getSubid,
   getStatsAttribution,
+  getStatsSources,
+  saveTrafficSrc,
+  getTrafficSrc,
   getOrdersMissingConsultation,
   bumpConsultationAttempts,
   claimPostback,
