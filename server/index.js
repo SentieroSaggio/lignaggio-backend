@@ -49,6 +49,8 @@ function ensurePremiumPDF(calculationId, pdfData) {
 const keitaro = require('../services/keitaro');
 // Our own ?src= campaign labels - deliberately outside the Keitaro channel.
 const traffic = require('../services/traffic');
+// Retry policy for mail failures - see the module for why it has to exist.
+const { isPermanentSmtpFailure } = require('../services/smtp');
 
 // ── Google Analytics 4 reporting (read-only, admin panel only) ────────────
 const googleAnalytics = require('../services/googleAnalytics');
@@ -976,8 +978,46 @@ async function resolvePartnerDataWithRetry(calculationId, maxRetries, delayMs) {
   return null;
 }
 
-async function generateFullConsultation(calculationId) {
+/**
+ * In-flight consultations, keyed by calculation id.
+ *
+ * Four paths want the same reading: the Stripe webhook, POST /api/confirm-payment,
+ * POST /api/generate-consultation, and the reconciler sweep. They did not know
+ * about each other, so an order whose reconcile window overlapped the checkout
+ * path was written twice — two full paid completions for one purchase, and the
+ * second one silently overwrote the first. Same pattern as _pdfInFlight.
+ */
+const _consultationInFlight = new Map();
+
+/**
+ * Generate the paid 10-section reading, joining a build already running for
+ * this order instead of starting a second one.
+ * @param {string} calculationId
+ * @returns {Promise<boolean>} true when a consultation was stored
+ */
+function generateFullConsultation(calculationId) {
+  const running = _consultationInFlight.get(calculationId);
+  if (running) {
+    console.log('[generateFullConsultation] Already in flight for', calculationId, '— joining it.');
+    return running;
+  }
+
+  const build = runFullConsultation(calculationId)
+    .finally(function () { _consultationInFlight.delete(calculationId); });
+
+  _consultationInFlight.set(calculationId, build);
+  return build;
+}
+
+async function runFullConsultation(calculationId) {
   console.log('[generateFullConsultation] Starting for calculation_id:', calculationId);
+
+  // A concurrent path may have finished while this one was queued.
+  const existing = db.getConsultation(calculationId);
+  if (existing) {
+    console.log('[generateFullConsultation] Consultation already stored for:', calculationId, '— skipping.');
+    return true;
+  }
 
   // Retry up to 5 times with 1 s delay to handle race condition
   const resolved = await resolvePartnerDataWithRetry(calculationId, 5, 1000);
@@ -1749,6 +1789,19 @@ async function checkAbandonedSessions() {
         );
       } catch (err) {
         console.error('[abandoned-cart] Error sending to', row.email, err.message);
+        // A final rejection is recorded as handled: the address is unusable, and
+        // leaving the row unmarked would queue it again in five minutes and every
+        // five minutes after that. A transient failure is left alone on purpose,
+        // so a brief outage still gets its retry.
+        if (isPermanentSmtpFailure(err)) {
+          try {
+            db.markAbandonedSent(row.calculation_id);
+            console.warn('[abandoned-cart] Address is undeliverable —', row.email,
+                         '— giving up on', row.calculation_id);
+          } catch (dbErr) {
+            console.error('[abandoned-cart] Could not mark', row.calculation_id, '—', dbErr.message);
+          }
+        }
       }
     }
   } catch (err) {
