@@ -797,6 +797,25 @@ REGOLE DI FORMATO ASSOLUTE:
 - Limiti per sezione (caratteri con spazi): panorama 1400-1900, partner1 1400-1800, partner2 1400-1800, couple 1500-1900, anima 1400-1800, karma 1400-1800, intimita 1400-1800, finanze 1400-1800, potentiale 1400-1800, consiglio 1000-1300.
 - Ogni tempo dell'architettura occupa due-tre frasi: la sezione resta densa, mai gonfiata per raggiungere il limite.`;
 
+/**
+ * The keys each reading must come back with, in order.
+ *
+ * Spelled out at the end of the user message as well as in the system rules,
+ * and both now read from here. They have to agree: the first version of this
+ * work left "esattamente 11 chiavi" at the end of the user prompt while the
+ * system prompt asked for 15, and being the last instruction the model read,
+ * that one won — it returned the old eleven and dropped every Fiamme Gemelle
+ * section, with nothing in the logs to notice.
+ */
+const FAMIGLIA_SECTION_KEYS = [
+  'panorama', 'partner1', 'partner2', 'couple', 'anima', 'karma', 'intimita',
+  'finanze', 'potentiale', 'consiglio', 'esercizi',
+];
+const COPPIA_SECTION_KEYS = [
+  'panorama', 'partner1', 'partner2', 'couple', 'anima', 'karma', 'intimita',
+  'finanze', 'potentiale', 'fiamma1', 'fiamma2', 'unione', 'passi', 'consiglio', 'esercizi',
+];
+
 // ── Fiamme Gemelle — four sections the couple reading adds ──────────────────
 //
 // Kept as a derivation of the base prompt, the same way FAMIGLIA_SYSTEM_PROMPT
@@ -808,16 +827,21 @@ REGOLE DI FORMATO ASSOLUTE:
 // They are an addition, not a contract: generateFullConsultation still accepts
 // a reading without them rather than throwing away a paid generation.
 const COPPIA_SYSTEM_PROMPT = (function buildCoppiaPrompt() {
-  const OLD_KEYS = 'ESATTAMENTE queste 11 chiavi, né più né meno:\n' +
-    '  panorama, partner1, partner2, couple, anima, karma, intimita, finanze, potentiale, consiglio, esercizi';
-  const NEW_KEYS = 'ESATTAMENTE queste 15 chiavi, né più né meno:\n' +
-    '  panorama, partner1, partner2, couple, anima, karma, intimita, finanze, potentiale,\n' +
-    '  fiamma1, fiamma2, unione, passi, consiglio, esercizi';
+  // Both lists come from the section-key constants, so the prompt can never
+  // ask for a different set than the rest of the file expects.
+  const OLD_KEYS = 'ESATTAMENTE queste ' + FAMIGLIA_SECTION_KEYS.length + ' chiavi, né più né meno:\n' +
+    '  ' + FAMIGLIA_SECTION_KEYS.join(', ');
+  const NEW_KEYS = 'ESATTAMENTE queste ' + COPPIA_SECTION_KEYS.length + ' chiavi, né più né meno:\n' +
+    '  ' + COPPIA_SECTION_KEYS.join(', ');
+
+  // Every key but "esercizi" is a plain string.
+  const OLD_STRINGS = FAMIGLIA_SECTION_KEYS.length - 1;
+  const NEW_STRINGS = COPPIA_SECTION_KEYS.length - 1;
 
   const edits = [
     [OLD_KEYS, NEW_KEYS],
-    ['- Le prime 10 chiavi sono stringhe con paragrafi separati da',
-     '- Le prime 14 chiavi sono stringhe con paragrafi separati da'],
+    ['- Le prime ' + OLD_STRINGS + ' chiavi sono stringhe con paragrafi separati da',
+     '- Le prime ' + NEW_STRINGS + ' chiavi sono stringhe con paragrafi separati da'],
     ['- Lunghezza totale delle 10 sezioni: 14000–18000 caratteri (con spazi).',
      '- Lunghezza totale delle 14 sezioni: 19000–24000 caratteri (con spazi).'],
     ['La sezione "consiglio" non segue questo schema: contiene il piano progressivo descritto nelle istruzioni.',
@@ -1030,16 +1054,7 @@ function buildConsultationPrompt(data) {
   // and would read badly, between a parent and a child.
   const fiamme = isFamiglia ? '' : fiammeBlock(p1.birthDate, p2.birthDate);
 
-  // Spelled out at the end of the user message as well as in the system rules.
-  // The two have to agree: the first version of this said "esattamente 11
-  // chiavi" here while the system prompt asked for 15, and being the last
-  // instruction the model read, this one won — it returned the old eleven and
-  // dropped every Fiamme Gemelle section without any error to notice.
-  const keyList = isFamiglia
-    ? ['panorama','partner1','partner2','couple','anima','karma','intimita',
-       'finanze','potentiale','consiglio','esercizi']
-    : ['panorama','partner1','partner2','couple','anima','karma','intimita',
-       'finanze','potentiale','fiamma1','fiamma2','unione','passi','consiglio','esercizi'];
+  const keyList = isFamiglia ? FAMIGLIA_SECTION_KEYS : COPPIA_SECTION_KEYS;
 
   const profile = summariseRelationalProfile(quizContext);
   const profileBlock = profile
@@ -2195,6 +2210,15 @@ app.get('/health', function (req, res) {
     openai:   openaiReady,
     database: dbReady,
     keitaro:  keitaroReady,
+    // Which build is actually answering. Render sets RENDER_GIT_COMMIT itself,
+    // so this needs no configuration — and it is the only way to tell from
+    // outside whether a push has really gone live or the previous build is
+    // still being served after a failed deploy.
+    commit:   (process.env.RENDER_GIT_COMMIT || 'local').slice(0, 7),
+    // Sections the couple reading is currently asked to produce. If a prompt
+    // edit silently stops asking for one, it shows up here instead of in a
+    // customer's PDF.
+    sections: COPPIA_SECTION_KEYS.length,
   });
 });
 
