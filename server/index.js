@@ -47,10 +47,14 @@ function ensurePremiumPDF(calculationId, pdfData) {
 
 // ── Keitaro attribution (analytics side effect — never blocks a payment) ──
 const keitaro = require('../services/keitaro');
-// Our own ?src= campaign labels - deliberately outside the Keitaro channel.
+// Our own ?src= campaign labels — deliberately not part of the Keitaro channel.
 const traffic = require('../services/traffic');
 // Retry policy for mail failures - see the module for why it has to exist.
 const { isPermanentSmtpFailure } = require('../services/smtp');
+// Fiamme Gemelle: the bond named from the two days of birth. Byte-identical to
+// public/js/fiamme-bond.js — the funnel and the reading must never disagree
+// about which bond a couple has, so both read the same table.
+const fiammeBond = require('../services/fiammeBond');
 
 // ── Google Analytics 4 reporting (read-only, admin panel only) ────────────
 const googleAnalytics = require('../services/googleAnalytics');
@@ -357,8 +361,30 @@ app.post(
         break;
       }
       case 'checkout.session.completed': {
-        const session = event.data.object;
+        const session  = event.data.object;
+        const metadata = session.metadata || {};
         console.log('🧾 Checkout session completed:', session.id);
+
+        // A follow-up Analisi Focus. Nothing else in the funnel uses Checkout,
+        // so the `product` tag is what tells the two apart.
+        if (metadata.product === 'bonus_focus') {
+          const cid   = metadata.calculation_id;
+          const focus = metadata.bonus_focus;
+
+          if (cid && focus && session.payment_status === 'paid') {
+            // The status guard makes a webhook retry a no-op instead of a
+            // second generation.
+            const claimed = db.markExtraPaid(cid, focus);
+            if (claimed) {
+              console.log('[bonus] Extra lens paid:', focus, 'for', cid);
+              generateBonusFocus(cid, focus, 'extra').catch(function (err) {
+                console.error('[bonus] Extra generation error:', err.message);
+              });
+            } else {
+              console.log('[bonus] Extra lens already claimed — ignoring retry for', cid, focus);
+            }
+          }
+        }
         break;
       }
       default:
@@ -406,9 +432,9 @@ app.post('/api/track/visit', function (req, res) {
   try {
     db.recordVisit(
       (req.query && req.query.page) || (req.body && req.body.page),
-      // Our own campaign label, present only on the arrival that carried it
-      // in the URL - see public/google-tag.js for why it is never read back
-      // from storage. db.recordVisit validates it and drops the unexpected.
+      // Our own campaign label, present only on the arrival that carried it in
+      // the URL — see public/google-tag.js for why it is never read back from
+      // storage. db.recordVisit validates it and drops anything unexpected.
       (req.query && req.query.src)  || (req.body && req.body.src)
     );
   } catch (err) {
@@ -585,11 +611,11 @@ app.post('/create-payment-intent', async (req, res) => {
       }
     }
 
-    // -- Our own campaign label ------------------------------------------
-    // Backfill only: it is not sent to Stripe and not reported to anyone.
-    // The sale is attributed later by reading sessions.traffic_src, so a
-    // label that never made it into the session at preview time still counts
-    // if the browser is carrying one now.
+    // ── Our own campaign label ──────────────────────────────────────────────
+    // Backfill only: it is not sent to Stripe and not reported to anyone. The
+    // sale is attributed later by reading sessions.traffic_src, so a label that
+    // never made it into the session at preview time still counts if the
+    // browser is carrying one now.
     if (calculation_id) {
       const cleanSrc = traffic.sanitizeSource(src);
       if (cleanSrc) {
@@ -734,6 +760,17 @@ PRINCIPI DI STILE OBBLIGATORI:
 - Raccomandazioni pratiche in ogni sezione.
 - Paragrafi corti: massimo 3-4 frasi ciascuno.
 - Usa \\n\\n per separare i paragrafi.
+- Parla con autorità e certezza: "La Matrice rivela…", "I numeri mostrano…". VIETATE le parole "forse", "potrebbe", "è possibile", "probabilmente".
+
+ARCHITETTURA OBBLIGATORIA DI OGNI SEZIONE (in quest'ordine, senza titoli o etichette visibili):
+1. IL PUNTO DOLENTE — apri con la difficoltà concreta che questa coppia già vive, formulata così precisamente che si riconoscono nella prima frase.
+2. COME POTREBBE ESSERE — mostra la versione della relazione che si apre quando quel punto si scioglie.
+3. L'OSTACOLO NASCOSTO — spiega perché finora non ci sono riusciti, ancorandolo ai numeri e agli elementi calcolati.
+4. LA SOLUZIONE — cosa cambia concretamente, in un modo che solo questa lettura poteva rivelare.
+5. CHIUSURA IN DUE TEMPI — un'azione precisa da fare questa settimana, poi una frase che inizia con "Tra tre mesi…" e descrive il cambiamento che vedranno.
+
+Il lettore deve pensare: "Ecco perché succedeva! Ora so cosa fare."
+La sezione "consiglio" non segue questo schema: contiene il piano progressivo descritto nelle istruzioni.
 
 CALCOLI NUMEROLOGICI (eseguili tu prima di scrivere):
 - Numero del Cammino di Vita = somma di tutte le cifre della data di nascita ridotta a cifra singola (eccetto master number 11, 22, 33).
@@ -749,12 +786,66 @@ CALCOLI ASTROLOGICI (eseguili tu):
 
 REGOLE DI FORMATO ASSOLUTE:
 - Rispondi ESCLUSIVAMENTE con JSON valido. Zero testo fuori dal JSON. Zero markdown. Zero commenti.
-- Il JSON deve contenere ESATTAMENTE queste 10 chiavi, né più né meno:
-  panorama, partner1, partner2, couple, anima, karma, intimita, finanze, potentiale, consiglio
-- Ogni valore è una stringa con paragrafi separati da \\n\\n.
+- Il JSON deve contenere ESATTAMENTE queste 11 chiavi, né più né meno:
+  panorama, partner1, partner2, couple, anima, karma, intimita, finanze, potentiale, consiglio, esercizi
+- Le prime 10 chiavi sono stringhe con paragrafi separati da \\n\\n.
+- "esercizi" è un ARRAY di ESATTAMENTE 10 oggetti, uno per ogni sezione, nello stesso ordine delle sezioni:
+  { "sezione": "<chiave della sezione>", "titolo": "<massimo 45 caratteri>", "durata": "<es. 3 minuti>", "testo": "<200-320 caratteri: istruzione pratica che la coppia esegue insieme, scritta al presente, senza teoria — solo cosa fanno, dove e in che ordine>" }
+  Ogni esercizio riprende l'azione promessa nella chiusura della sua sezione e la rende eseguibile stasera.
 - Lingua: italiano. Registro formale ("Lei").
-- Lunghezza totale di tutte le sezioni: 7000–9000 caratteri (con spazi).
-- Limiti per sezione (caratteri con spazi): panorama 700-900, partner1 700-900, partner2 700-900, couple 800-1100, anima 700-900, karma 700-900, intimita 700-900, finanze 700-900, potentiale 700-900, consiglio 500-700.`;
+- Lunghezza totale delle 10 sezioni: 14000–18000 caratteri (con spazi).
+- Limiti per sezione (caratteri con spazi): panorama 1400-1900, partner1 1400-1800, partner2 1400-1800, couple 1500-1900, anima 1400-1800, karma 1400-1800, intimita 1400-1800, finanze 1400-1800, potentiale 1400-1800, consiglio 1000-1300.
+- Ogni tempo dell'architettura occupa due-tre frasi: la sezione resta densa, mai gonfiata per raggiungere il limite.`;
+
+// ── Fiamme Gemelle — four sections the couple reading adds ──────────────────
+//
+// Kept as a derivation of the base prompt, the same way FAMIGLIA_SYSTEM_PROMPT
+// is, and applied ONLY to the couple funnel. A parent-and-child reading must
+// never be asked about twin flames.
+//
+// The three new narrative keys are fiamma1 / fiamma2 / unione — him, her, and
+// what stands between them — plus "passi", the concrete moves for this bond.
+// They are an addition, not a contract: generateFullConsultation still accepts
+// a reading without them rather than throwing away a paid generation.
+const COPPIA_SYSTEM_PROMPT = (function buildCoppiaPrompt() {
+  const OLD_KEYS = 'ESATTAMENTE queste 11 chiavi, né più né meno:\n' +
+    '  panorama, partner1, partner2, couple, anima, karma, intimita, finanze, potentiale, consiglio, esercizi';
+  const NEW_KEYS = 'ESATTAMENTE queste 15 chiavi, né più né meno:\n' +
+    '  panorama, partner1, partner2, couple, anima, karma, intimita, finanze, potentiale,\n' +
+    '  fiamma1, fiamma2, unione, passi, consiglio, esercizi';
+
+  const edits = [
+    [OLD_KEYS, NEW_KEYS],
+    ['- Le prime 10 chiavi sono stringhe con paragrafi separati da',
+     '- Le prime 14 chiavi sono stringhe con paragrafi separati da'],
+    ['- Lunghezza totale delle 10 sezioni: 14000–18000 caratteri (con spazi).',
+     '- Lunghezza totale delle 14 sezioni: 19000–24000 caratteri (con spazi).'],
+    ['La sezione "consiglio" non segue questo schema: contiene il piano progressivo descritto nelle istruzioni.',
+     'Le sezioni "consiglio" e "passi" non seguono questo schema: contengono i piani descritti nelle istruzioni.'],
+    ['consiglio 1000-1300.',
+     'consiglio 1000-1300, fiamma1 1200-1600, fiamma2 1200-1600, unione 1400-1800, passi 1100-1500.'],
+    // The exercise list stays at ten and keeps mapping to the ten original
+    // sections: normaliseEsercizi() slices there, and the seven-day ritual is
+    // built on that length. The four new sections carry their own action.
+    ['- "esercizi" è un ARRAY di ESATTAMENTE 10 oggetti, uno per ogni sezione, nello stesso ordine delle sezioni:',
+     '- "esercizi" è un ARRAY di ESATTAMENTE 10 oggetti, uno per ciascuna di queste dieci sezioni e in\n' +
+     '  quest\'ordine: panorama, partner1, partner2, couple, anima, karma, intimita, finanze, potentiale,\n' +
+     '  consiglio. Le sezioni fiamma1, fiamma2, unione e passi NON hanno esercizio, ma vanno comunque scritte:'],
+  ];
+
+  let prompt = CONSULTATION_SYSTEM_PROMPT;
+  edits.forEach(function ([from, to], i) {
+    if (prompt.indexOf(from) === -1) {
+      // A silent no-op here would ask GPT for 11 keys while every consumer
+      // downstream expects 15 — and nothing would look broken until a customer
+      // opened a PDF with four sections missing. Fail at boot instead.
+      throw new Error('[COPPIA_SYSTEM_PROMPT] anchor ' + i + ' not found in CONSULTATION_SYSTEM_PROMPT — ' +
+                      'the base prompt changed; update the edits above.');
+    }
+    prompt = prompt.replace(from, to);
+  });
+  return prompt;
+}());
 
 const ARCH_LABELS = {
   1:'Iniziatore', 2:'Intuito', 3:'Creativo', 4:'Costruttore', 5:'Avventuriero',
@@ -763,6 +854,138 @@ const ARCH_LABELS = {
   15:'Abbondanza', 16:'Risveglio', 17:'Stella', 18:'Illusione', 19:'Sole',
   20:'Giudizio', 21:'Mondo', 22:'Costruttore Maestro',
 };
+
+/**
+ * JSON.parse that answers null instead of throwing.
+ * @param {string|null|undefined} str
+ * @returns {any|null}
+ */
+function safeParseJson(str) {
+  if (!str) { return null; }
+  try { return JSON.parse(str); } catch (_) { return null; }
+}
+
+/**
+ * The model returns `esercizi` as an array of practice cards. It is a young
+ * field, so treat anything unexpected as "no exercises" rather than letting a
+ * malformed value reach the PDF template or the ritual e-mails.
+ *
+ * @param {unknown} value  raw `esercizi` from the parsed completion
+ * @returns {Array<{sezione: string, titolo: string, durata: string, testo: string}>}
+ */
+function normaliseEsercizi(value) {
+  if (!Array.isArray(value)) { return []; }
+  return value
+    .filter(function (item) {
+      return item && typeof item === 'object' && typeof item.testo === 'string' && item.testo.trim();
+    })
+    .map(function (item) {
+      return {
+        sezione: String(item.sezione || '').trim(),
+        titolo:  String(item.titolo  || '').trim(),
+        durata:  String(item.durata  || '').trim(),
+        testo:   String(item.testo).trim(),
+      };
+    })
+    .slice(0, 10);
+}
+
+// =====================================================
+// GENITORI E FIGLI
+//
+// The same two birth dates, the same arcana, the same architecture — and a
+// completely different reading, because the words that describe a couple are
+// wrong between a parent and a child. Only the wording lives here; every
+// calculation is shared with the couple funnel.
+// =====================================================
+
+const FAMIGLIA_SYSTEM_PROMPT = CONSULTATION_SYSTEM_PROMPT
+  .replace(
+    'specializzato nell\'analisi della compatibilità di coppia',
+    'specializzato nell\'analisi del legame tra genitori e figli')
+  .replace(
+    'Unisci numerologia, astrologia e psicologia delle relazioni',
+    'Unisci numerologia, astrologia e psicologia dello sviluppo e delle relazioni familiari')
+  .replace(
+    '- Rivolgiti DIRETTAMENTE al cliente: usa "Lei", "il Suo partner", "nella vostra relazione".',
+    '- Rivolgiti DIRETTAMENTE al genitore: usa "Lei", "Suo figlio" o "Sua figlia", "nel vostro rapporto".\n' +
+    '- VIETATO ogni linguaggio da coppia romantica: mai "amore di coppia", "passione", "intimità fisica", "partner".\n' +
+    '- Il tema è il legame fra due generazioni: riconoscimento, eredità, distanza e ritorno, autonomia.')
+  .replace(
+    '- Chiama i partner SEMPRE per nome in ogni sezione — mai "Partner 1" o "Partner 2".',
+    '- Chiama entrambi SEMPRE per nome in ogni sezione — mai "genitore" o "figlio" come etichette.');
+
+/**
+ * Section instructions for the parent-and-child reading.
+ *
+ * The ten keys are the same as the couple reading — the whole delivery chain
+ * (page, PDF, email, exercises) is built on them — but each one asks for
+ * something else.
+ *
+ * @param {string} name1 the parent
+ * @param {string} name2 the child
+ * @returns {string}
+ */
+function famigliaSectionInstructions(name1, name2) {
+  return `panorama — Quadro d'insieme del legame fra ${name1} e ${name2}. Che tipo di rapporto è: di riconoscimento, di specchio, di opposizione feconda? Cita il numero che nasce dalle due date e il suo significato per una relazione fra generazioni.
+
+partner1 — Ritratto di ${name1} come genitore, non come persona in astratto. Numero del Cammino di Vita, segno, pianeta dominante. Cosa dà con naturalezza, cosa gli o le costa fatica dare. Tono: "${name1}, il Suo Cammino porta il numero [X]…"
+
+partner2 — Ritratto di ${name2}: come arriva al mondo, di cosa ha bisogno per fiorire, cosa chiede senza saperlo chiedere. Numero, segno, elemento. Se è adulto o adulta, parlane come di una persona adulta, non di un bambino.
+
+couple — Il campo che si crea fra loro due: dove si riconoscono, dove si scontrano, cosa attiva l'uno nell'altro. Ruoli naturali e ruoli invertiti (chi si preoccupa per chi).
+
+anima — Il legame profondo: cosa li lega al di là del dovere familiare. Numero karmico. Perché queste due anime si sono scelte come genitore e figlio.
+
+karma — L'eredità: cosa passa da una generazione all'altra, consapevolmente e no. Gli schemi che ${name1} ha ricevuto e sta trasmettendo. Cosa può fermarsi qui.
+
+intimita — La vicinanza quotidiana, MAI in senso romantico o fisico-sessuale: quanto si raccontano, come si dimostrano affetto, cosa li fa sentire vicini e cosa li allontana. Il ritmo di distanza e ritorno.
+
+finanze — Autonomia e sostegno: quanto ${name2} è libero o libera di scegliere, quanto ${name1} riesce a sostenere senza sostituirsi. Il denaro come linguaggio di potere e di cura fra genitore e figlio.
+
+potentiale — Cosa può diventare questo rapporto negli anni che vengono. Cosa si sblocca se ${name1} e ${name2} attraversano il punto difficile che i numeri mostrano.
+
+consiglio — PIANO PROGRESSIVO per ${name1}, in questa forma esatta:
+"Questa settimana: [azione precisa]."
+"Questo mese: [azione che consolida]."
+"Nei prossimi tre mesi: [abitudine da costruire insieme]."
+Chiudi con il futuro che li attende se lo seguono.`;
+}
+
+/** Italian names for the axes the `relazione` questions measure. */
+const RELATIONAL_AXIS_LABELS = {
+  attachment:      'Stile di attaccamento',
+  conflict_style:  'Stile nel conflitto',
+  love_language:   'Linguaggio dell\'amore',
+  intimacy_rhythm: 'Ritmo del riavvicinamento',
+};
+
+/**
+ * Condenses the `relazione` answers into a few labelled lines.
+ *
+ * Only the first answer per axis counts, matching what the offer page shows the
+ * visitor — the reading must not contradict the free profile they already read.
+ *
+ * @param {Array<{axis?: string, value?: string}>} quizContext
+ * @returns {string|null} null when the answers carry no axes
+ */
+function summariseRelationalProfile(quizContext) {
+  if (!Array.isArray(quizContext)) { return null; }
+
+  const seen = {};
+  for (const answer of quizContext) {
+    if (!answer || !answer.axis || !answer.value) { continue; }
+    if (!RELATIONAL_AXIS_LABELS[answer.axis]) { continue; }
+    if (seen[answer.axis]) { continue; }
+    seen[answer.axis] = answer.value;
+  }
+
+  const lines = Object.keys(RELATIONAL_AXIS_LABELS)
+    .filter(function (axis) { return seen[axis]; })
+    .map(function (axis) { return '- ' + RELATIONAL_AXIS_LABELS[axis] + ': ' + seen[axis]; });
+
+  return lines.length ? lines.join('\n') : null;
+}
 
 function buildConsultationPrompt(data) {
   const p1     = data.partner1     || {};
@@ -794,7 +1017,40 @@ function buildConsultationPrompt(data) {
     quizBlock = '\n\n═══ RISPOSTE AL QUIZ ═══\n' + lines;
   }
 
-  return `Genera una consulenza di compatibilità premium, in italiano (registro formale "Lei"), per la seguente coppia.
+  // The relational profile, when the answers carry it. Stating it as data
+  // rather than leaving it buried in prose is what makes the reading name the
+  // pattern instead of describing the couple in general terms.
+  // Who these two people are decides which set of section briefs is used.
+  const isFamiglia = data.mode === 'famiglia';
+  const sectionInstructions = isFamiglia
+    ? famigliaSectionInstructions(name1, name2)
+    : coppiaSectionInstructions(name1, name2);
+
+  // Twin flames belong to the couple funnel only — the idea makes no sense,
+  // and would read badly, between a parent and a child.
+  const fiamme = isFamiglia ? '' : fiammeBlock(p1.birthDate, p2.birthDate);
+
+  // Spelled out at the end of the user message as well as in the system rules.
+  // The two have to agree: the first version of this said "esattamente 11
+  // chiavi" here while the system prompt asked for 15, and being the last
+  // instruction the model read, this one won — it returned the old eleven and
+  // dropped every Fiamme Gemelle section without any error to notice.
+  const keyList = isFamiglia
+    ? ['panorama','partner1','partner2','couple','anima','karma','intimita',
+       'finanze','potentiale','consiglio','esercizi']
+    : ['panorama','partner1','partner2','couple','anima','karma','intimita',
+       'finanze','potentiale','fiamma1','fiamma2','unione','passi','consiglio','esercizi'];
+
+  const profile = summariseRelationalProfile(quizContext);
+  const profileBlock = profile
+    ? `\n\n═══ PROFILO RELAZIONALE (dalle risposte) ═══\n${profile}\n` +
+      'Usa questo profilo nelle sezioni anima, karma e intimita: nomina il pattern ' +
+      'esplicitamente e collega ogni consiglio al modo in cui questa coppia reagisce davvero.'
+    : '';
+
+  return `Genera una consulenza premium, in italiano (registro formale "Lei"), ${isFamiglia
+    ? 'sul legame fra il genitore e il figlio qui sotto'
+    : 'sulla compatibilità della coppia qui sotto'}.
 
 ═══ DATI DI INPUT ═══
 
@@ -812,11 +1068,34 @@ Archetipo: ${a2Label} (n. ${arch2})
 
 COPPIA
 Archetipo di coppia: ${acLabel} (n. ${archC})
-Score di compatibilità: ${score}%${quizBlock}
+Score di compatibilità: ${score}%${fiamme}${quizBlock}${profileBlock}
 
 ═══ ISTRUZIONI PER OGNI SEZIONE ═══
 
-panorama — Quadro d'insieme del legame. Entrambi i nomi obbligatori. Descrivi il tipo di legame (karmico, destinale, trasformazionale). Cita il numero di compatibilità della coppia calcolato e il suo significato. Compatibilità degli elementi zodiacali. Tono di apertura: "Il vostro incontro non è casuale. Il numero della vostra compatibilità è [X], il che significa…"
+Ogni sezione (tranne "consiglio") segue l'architettura in 5 tempi definita nelle regole di sistema: punto dolente → come potrebbe essere → ostacolo nascosto → soluzione → azione di questa settimana + frase "Tra tre mesi…". Le indicazioni qui sotto dicono DI COSA parla ciascuna sezione; l'architettura resta la stessa.
+
+${sectionInstructions}
+
+═══ REQUISITI FINALI ═══
+- Totale delle sezioni narrative: ${isFamiglia ? '14000–18000' : '19000–24000'} caratteri con spazi. Rispetta i limiti per sezione.
+- Aggiungi la chiave "esercizi": array di 10 esercizi pratici, uno per ciascuna delle sezioni
+  panorama, partner1, partner2, couple, anima, karma, intimita, finanze, potentiale, consiglio — in quest'ordine.
+- Usa i nomi ${name1} e ${name2} in ogni sezione.
+- Calcola correttamente i numeri numerologici e i segni zodiacali dalle date di nascita fornite.
+- Ogni affermazione ancorata a numero, pianeta o elemento calcolato.
+- Rispondi SOLO con JSON valido, con ESATTAMENTE queste ${keyList.length} chiavi in quest'ordine:
+  ${keyList.join(', ')}
+- Nessuna chiave può mancare. Prima di rispondere, ricontrolla di averle scritte tutte e ${keyList.length}.`;
+}
+
+/**
+ * Section instructions for the couple reading.
+ * @param {string} name1
+ * @param {string} name2
+ * @returns {string}
+ */
+function coppiaSectionInstructions(name1, name2) {
+  return `panorama — Quadro d'insieme del legame. Entrambi i nomi obbligatori. Descrivi il tipo di legame (karmico, destinale, trasformazionale). Cita il numero di compatibilità della coppia calcolato e il suo significato. Compatibilità degli elementi zodiacali. Tono di apertura: "Il vostro incontro non è casuale. Il numero della vostra compatibilità è [X], il che significa…"
 
 partner1 — Rivolgersi direttamente a ${name1} con "Lei". Numero del Cammino di Vita + segno zodiacale + pianeta dominante + archetipo. Ruolo che ${name1} porta nella coppia. Punti di forza e sfide. Tono: "${name1}, il Suo Cammino di Vita porta il numero [X]…"
 
@@ -834,14 +1113,51 @@ finanze — Vita materiale e finanziaria della coppia. Numeri di vita applicati 
 
 potentiale — Futuro della coppia. Verso dove porta il cammino comune. Cosa si sblocca superando le sfide karmiche. Visione più alta. Tono: "Il potenziale evolutivo della vostra unione porta il numero [X]. Se attraverserete…"
 
-consiglio — 3 consigli concreti, ciascuno ancorato a un numero o pianeta. Messaggio finale caldo e incoraggiante. Tono: "${name1} e ${name2}, ecco tre indicazioni pratiche: 1. … 2. … 3. … Il vostro incontro è un dono."
+fiamma1 — LA FIAMMA DI ${name1}. Rivolgersi a ${name1} con "Lei". Il numero dell'Anima di ${name1} (le cifre del solo giorno di nascita, ridotte) e che cosa dice del Suo ruolo dentro questa dinamica: se è ${name1} a cercare o a ritirarsi, che cosa la attira in ${name2} e che cosa la spaventa, quale parte di sé ${name1} vede riflessa nell'altro. Nomina la ferita che questo legame le riapre. Chiudi come tutte le sezioni: azione di questa settimana + "Tra tre mesi…".
 
-═══ REQUISITI FINALI ═══
-- Totale: 7000–9000 caratteri con spazi. Rispetta i limiti per sezione.
-- Usa i nomi ${name1} e ${name2} in ogni sezione.
-- Calcola correttamente i numeri numerologici e i segni zodiacali dalle date di nascita fornite.
-- Ogni affermazione ancorata a numero, pianeta o elemento calcolato.
-- Rispondi SOLO con JSON valido, esattamente 10 chiavi.`;
+fiamma2 — LA FIAMMA DI ${name2}, con la stessa struttura e lo stesso numero dell'Anima calcolato sul giorno di nascita di ${name2}. Deve essere davvero l'altra faccia: se ${name1} insegue, qui si spiega perché ${name2} si allontana — e viceversa. Vietato ripetere le frasi della sezione precedente.
+
+unione — IL LEGAME FRA LORO, non i due separatamente. Parti dal tipo di legame indicato nei DATI e chiamalo per nome, esattamente come è scritto lì: è lo stesso nome che ${name1} ha già visto prima del test, e deve ritrovarlo qui. Spiega perché proprio queste due date producono questa dinamica, che cosa il legame è venuto a insegnare a entrambi, e in che fase si trovano ora. Distingui con onestà l'intensità dall'armonia: un'attrazione fortissima non significa un rapporto facile, e va detto chiaramente senza spaventare. Se il legame porta un nome duro, trattalo come una dinamica su cui si può lavorare, MAI come una condanna o una diagnosi del rapporto.
+
+passi — PIANO DI RIAVVICINAMENTO specifico per QUESTO tipo di legame, diverso dal piano temporale della sezione "consiglio": qui non si parla di settimane e mesi, ma di che cosa fare nei momenti in cui la dinamica si accende. Da tre a cinque passi, ciascuno in questa forma esatta:
+"Quando [situazione concreta e riconoscibile di questa dinamica] → [che cosa fa ${name1}], [che cosa fa ${name2}]."
+Ogni passo deve essere un comportamento osservabile — che cosa dire, che cosa non fare, quanto aspettare — non un consiglio astratto tipo "comunicate di più". Ancora almeno due passi ai numeri o agli elementi calcolati. Chiudi con la frase che ${name1} e ${name2} possono dirsi quando la dinamica riparte.
+
+consiglio — PIANO PROGRESSIVO, non tre consigli sparsi. Tre passi ancorati ciascuno a un numero o pianeta, in questa forma esatta:
+"Questa settimana: [azione precisa, eseguibile in un'ora]."
+"Questo mese: [azione che consolida il passo precedente]."
+"Nei prossimi tre mesi: [rituale o abitudine che ${name1} e ${name2} costruiscono insieme]."
+Chiudi con il futuro luminoso che li attende se seguono il piano. Tono caldo, certo, incoraggiante.`;
+}
+
+/**
+ * The Fiamme Gemelle block for the user prompt: the bond named from the two
+ * days of birth, plus the phase from the month and year digits.
+ *
+ * Computed here from the birth dates rather than trusted from the browser, so
+ * the reading and the page the visitor already saw cannot disagree, and a
+ * hand-edited request cannot put a different bond in front of the model.
+ *
+ * @param {string} birth1 ISO "YYYY-MM-DD"
+ * @param {string} birth2 ISO "YYYY-MM-DD"
+ * @returns {string} '' when either date is unusable — the four sections then
+ *                   simply have less to anchor to, rather than inventing a bond
+ */
+function fiammeBlock(birth1, birth2) {
+  const reading = fiammeBond.reading(birth1, birth2);
+  if (!reading) { return ''; }
+
+  const b = reading.bond;
+  const p = reading.phase;
+
+  return `\n\n═══ FIAMME GEMELLE (calcolato — usalo, non ricalcolarlo) ═══
+Numero dell'Anima partner 1: ${reading.n1}
+Numero dell'Anima partner 2: ${reading.n2}
+TIPO DI LEGAME: ${b.name}${b.subtitle ? ' — ' + b.subtitle : ''}
+Che cosa significa: ${b.teaser}${p ? `
+FASE ATTUALE: ${p.name} — ${p.text}` : ''}
+
+Le sezioni fiamma1, fiamma2, unione e passi si appoggiano a questo blocco. Il nome del legame va usato ESATTAMENTE così com'è scritto qui: è lo stesso che la coppia ha già letto sul sito prima di pagare, e vederlo cambiare distruggerebbe la fiducia nella lettura.`;
 }
 
 // ── Preview system prompt (short, 4 sections, generated BEFORE payment) ──────
@@ -953,6 +1269,7 @@ async function resolvePartnerDataWithRetry(calculationId, maxRetries, delayMs) {
             partner2:      { name: row.partner2_name, gender: row.partner2_gender, birthDate: row.partner2_birth },
             compatibility: compat,
             quizContext:   row.quiz_context_json ? JSON.parse(row.quiz_context_json) : [],
+            mode:          row.mode || 'coppia',
           },
           payment: {
             status:      row.payment_status,
@@ -1037,9 +1354,11 @@ async function runFullConsultation(calculationId) {
         model:                 'gpt-5.4',
         response_format:       { type: 'json_object' },
         temperature:           0.7,
-        max_completion_tokens: 9000,
+        max_completion_tokens: 12000,
         messages: [
-          { role: 'system', content: CONSULTATION_SYSTEM_PROMPT },
+          { role: 'system', content: partnerData.mode === 'famiglia'
+              ? FAMIGLIA_SYSTEM_PROMPT
+              : COPPIA_SYSTEM_PROMPT },
           { role: 'user',   content: buildConsultationPrompt(partnerData) },
         ],
       });
@@ -1054,6 +1373,14 @@ async function runFullConsultation(calculationId) {
       if (missing.length > 0) {
         console.warn('[generateFullConsultation] Attempt', attempt, '— missing keys:', missing);
         continue;
+      }
+
+      // "esercizi" is an addition, not a contract: a consultation without it is
+      // still valid and must not be thrown away. Normalise it to an array so
+      // every consumer (email, PDF, ritual queue) can iterate without guarding.
+      parsed.esercizi = normaliseEsercizi(parsed.esercizi);
+      if (parsed.esercizi.length === 0) {
+        console.warn('[generateFullConsultation] No usable esercizi for:', calculationId);
       }
 
       // ── Persist consultation to DB ──────────────────────────────────────
@@ -1074,6 +1401,10 @@ async function runFullConsultation(calculationId) {
       sendConsultationEmail(calculationId, parsed, stored._partnerData).catch(function (err) {
         console.error('[email] sendConsultationEmail error for:', calculationId, err.message);
       });
+
+      // Seven days of exercises, one per day, from the reading just written.
+      try { enrolBuyerInRitual(calculationId, parsed); }
+      catch (err) { console.error('[ritual] enrol error for:', calculationId, err.message); }
 
       // Generate premium PDF (fire-and-forget)
       const pdfData = {
@@ -1105,6 +1436,265 @@ async function runFullConsultation(calculationId) {
 
   console.error('[generateFullConsultation] All attempts failed for calculation_id:', calculationId);
   return false;
+}
+
+// =====================================================
+// ANALISI FOCUS — the gift claimed after payment
+//
+// One of four lenses, generated as a second and deeper reading than the
+// matching section of the main consultation. It is a gift, not a product:
+// nothing here is priced, and a failure never blocks the paid report.
+// =====================================================
+
+const BONUS_FOCUS_LENSES = {
+  sessuale: {
+    label:   'Intimità e passione',
+    mirrors: 'intimita',
+    titles:  ["L'attrazione che vi ha uniti", 'Come si accende il desiderio',
+              'Il linguaggio dei corpi', 'Ciò che spegne la fiamma', 'Come tenerla viva'],
+    brief:   `Approfondisci la chimica fisica e la passione tra i partner:
+- attrazione fisica e polarità tra i due elementi
+- come si esprime il desiderio in questa coppia specifica
+- cosa lo accende e cosa lo spegne nella vita quotidiana
+- vulnerabilità e fiducia nel corpo, non solo nelle parole
+- come mantenere viva la fiamma quando la routine si installa`,
+  },
+  finanze: {
+    label:   'Prosperità di coppia',
+    mirrors: 'finanze',
+    titles:  ['Il vostro rapporto con il denaro', 'Chi porta quale energia',
+              'Dove nasce la vostra prosperità', 'Gli ostacoli economici', 'Il piano dei prossimi 90 giorni'],
+    brief:   `Approfondisci la gestione economica della coppia:
+- quale energia finanziaria porta ciascuno dei due
+- cosa blocca concretamente il canale del denaro in questa coppia
+- settori e attività dove questi due numeri prosperano insieme
+- divisione dei ruoli: chi guadagna, chi gestisce, chi frena, chi investe
+- obiettivi concreti a 90 giorni e come raggiungerli`,
+  },
+  karmico: {
+    label:   'Legame karmico',
+    mirrors: 'karma',
+    titles:  ['Il patto delle vostre anime', 'Il debito da sciogliere',
+              'I pattern che si ripetono', 'Le prove che vi attendono', 'Come chiudere il cerchio'],
+    brief:   `Approfondisci il legame karmico tra i partner:
+- perché queste due anime si sono scelte in questa vita
+- quale debito o lezione è rimasto aperto e come si ripresenta oggi
+- i pattern ricorrenti che tornano nella relazione
+- le prove che la coppia attraverserà e cosa insegnano
+- come completare la lezione invece di ripeterla`,
+  },
+  anima: {
+    label:   'Connessione animica',
+    mirrors: 'anima',
+    titles:  ['Perché le vostre anime si sono scelte', 'La risonanza silenziosa',
+              'Le ombre da integrare', 'Il linguaggio segreto della coppia', 'Il potenziale più alto'],
+    brief:   `Approfondisci la connessione animica profonda:
+- il livello di risonanza tra le due anime
+- la comunicazione che passa senza parole
+- le ombre che ciascuno proietta sull'altro e come integrarle
+- il linguaggio privato che solo questa coppia possiede
+- il potenziale spirituale più alto di questa unione`,
+  },
+};
+
+const BONUS_FOCUS_SYSTEM_PROMPT = `Sei lo stesso consulente che ha scritto la consulenza completa di questa coppia. Ora scrivi l'APPROFONDIMENTO che il cliente ha ricevuto in regalo: una seconda lettura, dedicata a un solo tema, molto più profonda della sezione corrispondente della consulenza.
+
+REGOLE DI CONTENUTO:
+- Non ripetere ciò che è già stato detto nella consulenza: questo testo va PIÙ A FONDO, con esempi concreti della vita quotidiana della coppia.
+- Ogni affermazione è ancorata a un numero, un elemento o un archetipo calcolato dalle date di nascita.
+- Chiama i partner per nome. Registro formale ("Lei", "voi" per la coppia).
+- Parla con certezza: mai "forse", "potrebbe", "è possibile".
+- Paragrafi corti: massimo 3-4 frasi.
+- Il cliente non ha pagato per questo testo: deve sentire di aver ricevuto più di quanto si aspettava.
+
+REGOLE DI FORMATO ASSOLUTE:
+- Rispondi ESCLUSIVAMENTE con JSON valido. Zero testo fuori dal JSON. Zero markdown.
+- Struttura esatta:
+  {
+    "titolo": "<titolo dell'approfondimento, massimo 60 caratteri>",
+    "sottotitolo": "<una frase che promette cosa scopriranno, massimo 120 caratteri>",
+    "sezioni": [ { "titolo": "<uno dei titoli forniti>", "testo": "<3 paragrafi separati da \\n\\n>" } ],
+    "esercizi": [ { "titolo": "<massimo 45 caratteri>", "durata": "<es. 15 minuti>", "testo": "<200-320 caratteri: istruzione pratica al presente>" } ]
+  }
+- "sezioni": ESATTAMENTE 5 oggetti, nell'ordine dei titoli forniti.
+- Ogni "testo" ha ESATTAMENTE 3 paragrafi, ciascuno di 3-4 frasi. Non uno in più, non uno in meno.
+- "esercizi": ESATTAMENTE 3 oggetti, pensati per essere fatti insieme.
+- Lingua: italiano.`;
+
+/**
+ * Builds the user prompt for the gift reading.
+ *
+ * The matching section of the paid consultation is passed in so the model can
+ * deliberately go past it — without it the gift tends to restate the report
+ * the buyer has already read, which reads as padding rather than a present.
+ *
+ * @param {string} focus         lens key
+ * @param {object} partnerData   { partner1, partner2, compatibility, quizContext }
+ * @param {object|null} consultation  the already-generated 10-section reading
+ * @returns {string}
+ */
+function buildBonusFocusPrompt(focus, partnerData, consultation) {
+  const lens   = BONUS_FOCUS_LENSES[focus];
+  const p1     = partnerData.partner1     || {};
+  const p2     = partnerData.partner2     || {};
+  const compat = partnerData.compatibility || {};
+
+  const name1 = p1.name || 'Partner 1';
+  const name2 = p2.name || 'Partner 2';
+  const a1    = compat.partner1Archetype      || '?';
+  const a2    = compat.partner2Archetype      || '?';
+  const ac    = compat.compatibilityArchetype || '?';
+  const score = compat.compatibilityScore != null ? compat.compatibilityScore + '%' : 'non calcolato';
+
+  const already = consultation && consultation[lens.mirrors]
+    ? `\n\n═══ GIÀ DETTO NELLA CONSULENZA (non ripeterlo, vai oltre) ═══\n${consultation[lens.mirrors]}`
+    : '';
+
+  const quiz = Array.isArray(partnerData.quizContext) && partnerData.quizContext.length
+    ? '\n\n═══ RISPOSTE AL QUIZ ═══\n' + partnerData.quizContext.map(function (a) {
+        return '- ' + (a.questionText || a.questionId) + ': ' + (a.selectedAnswerText || a.selectedAnswerKey);
+      }).join('\n')
+    : '';
+
+  return `Approfondimento in regalo sul tema: ${lens.label}.
+
+═══ DATI DELLA COPPIA ═══
+${name1} — nato/a il ${p1.birthDate || 'sconosciuta'} — archetipo ${ARCH_LABELS[a1] || a1} (n. ${a1})
+${name2} — nato/a il ${p2.birthDate || 'sconosciuta'} — archetipo ${ARCH_LABELS[a2] || a2} (n. ${a2})
+Archetipo di coppia: ${ARCH_LABELS[ac] || ac} (n. ${ac}) · Compatibilità: ${score}${quiz}${already}
+
+═══ FOCUS RICHIESTO ═══
+${lens.brief}
+
+═══ TITOLI DELLE 5 SEZIONI (usali esattamente, in quest'ordine) ═══
+${JSON.stringify(lens.titles)}
+
+Scrivi l'approfondimento completo per ${name1} e ${name2}. Solo JSON valido.`;
+}
+
+/**
+ * In-flight gift generations, keyed by calculation id.
+ *
+ * The choice screen polls while the reading is being written, and an impatient
+ * second tap used to find status 'generating' with no stored JSON — which looks
+ * exactly like a generation that died. Without this map that lookalike starts a
+ * second paid completion for one gift.
+ */
+const _bonusInFlight = new Map();
+
+/**
+ * Generates and stores the gift reading. Never throws: on failure the status is
+ * released so the buyer can retry with the same lens.
+ *
+ * @param {string} calculationId
+ * @param {string} focus
+ * @returns {Promise<boolean>} true when a reading was stored
+ */
+async function generateBonusFocus(calculationId, focus, target) {
+  const lens = BONUS_FOCUS_LENSES[focus];
+  if (!lens) { return false; }
+
+  // One key per lens, not per order: the gift and a purchased lens are two
+  // different readings and may legitimately be written at the same time.
+  const key = calculationId + ':' + focus;
+
+  const running = _bonusInFlight.get(key);
+  if (running) {
+    console.log('[bonus] Generation already in flight for', key, '— joining it.');
+    return running;
+  }
+
+  const build = runBonusFocusGeneration(calculationId, focus, lens, target || 'gift')
+    .finally(function () { _bonusInFlight.delete(key); });
+
+  _bonusInFlight.set(key, build);
+  return build;
+}
+
+/**
+ * The actual generation. Split from generateBonusFocus so the in-flight guard
+ * above wraps exactly one promise per lens.
+ *
+ * @param {string} target 'gift' (stored on the session row) or 'extra' (a
+ *                        purchased lens, stored in bonus_extra)
+ */
+async function runBonusFocusGeneration(calculationId, focus, lens, target) {
+  try {
+    const resolved = await resolvePartnerDataWithRetry(calculationId, 3, 1500);
+    if (!resolved) {
+      console.error('[bonus] Session not found for:', calculationId);
+      if (target === 'gift') { db.resetBonusStatus(calculationId); }
+      return false;
+    }
+
+    const partnerData  = resolved.stored._partnerData;
+    const consultRow   = db.getConsultation(calculationId);
+    const consultation = consultRow ? safeParseJson(consultRow.consultation_json) : null;
+    const userPrompt   = buildBonusFocusPrompt(focus, partnerData, consultation);
+
+    // The offer promises five chapters and three exercises. The model delivers
+    // that most of the time and occasionally drops one exercise, so one retry
+    // buys a complete gift; a second-best result still ships rather than
+    // leaving the buyer with an empty page.
+    let bonus = null;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const response = await openai.chat.completions.create({
+        model:                 'gpt-5.4',
+        response_format:       { type: 'json_object' },
+        temperature:           0.75,
+        max_completion_tokens: 6000,
+        messages: [
+          { role: 'system', content: BONUS_FOCUS_SYSTEM_PROMPT },
+          { role: 'user',   content: userPrompt },
+        ],
+      });
+
+      const parsed = JSON.parse(response.choices[0].message.content);
+
+      const candidate = {
+        focus,
+        label:       lens.label,
+        titolo:      String(parsed.titolo      || lens.label),
+        sottotitolo: String(parsed.sottotitolo || ''),
+        sezioni: (Array.isArray(parsed.sezioni) ? parsed.sezioni : [])
+          .filter(function (s) { return s && typeof s.testo === 'string' && s.testo.trim(); })
+          .map(function (s) {
+            return { titolo: String(s.titolo || '').trim(), testo: String(s.testo).trim() };
+          }),
+        esercizi: normaliseEsercizi(parsed.esercizi),
+      };
+
+      const complete = candidate.sezioni.length === 5 && candidate.esercizi.length === 3;
+      if (complete) { bonus = candidate; break; }
+
+      console.warn('[bonus] Attempt', attempt, 'incomplete —',
+        candidate.sezioni.length, 'sections,', candidate.esercizi.length, 'exercises.');
+
+      // Keep the fuller of the two attempts.
+      if (!bonus || candidate.sezioni.length > bonus.sezioni.length) { bonus = candidate; }
+    }
+
+    if (!bonus || bonus.sezioni.length === 0) {
+      throw new Error('bonus reading has no sections');
+    }
+
+    if (target === 'extra') {
+      db.saveExtraBonus(calculationId, focus, bonus);
+    } else {
+      db.saveBonusAnalysis(calculationId, bonus);
+    }
+
+    console.log('[bonus] Analisi Focus ready for:', calculationId, '— lens:', focus,
+      '—', target, '— sections:', bonus.sezioni.length);
+    return true;
+
+  } catch (err) {
+    console.error('[bonus] Generation failed for:', calculationId, focus, err.message);
+    // A purchased lens keeps its 'generating' status: the money is taken, so a
+    // retry must stay possible. Only the free gift is released back to 'idle'.
+    if (target === 'gift') { db.resetBonusStatus(calculationId); }
+    return false;
+  }
 }
 
 // ── Data validation ──────────────────────────────────────────────────────────
@@ -1245,7 +1835,7 @@ app.post('/api/confirm-payment', async (req, res) => {
 // Called during the analysis phase, BEFORE payment.
 // Creates the stored entry and generates a short 4-section teaser preview.
 app.post('/api/generate-preview', async (req, res) => {
-  const { calculation_id, partner1, partner2, compatibility, quizContext, subid, src } = req.body || {};
+  const { calculation_id, partner1, partner2, compatibility, quizContext, subid, src, mode } = req.body || {};
 
   if (!calculation_id || !String(calculation_id).trim()) {
     return res.status(400).json({ success: false, error: 'missing_calculation_id' });
@@ -1283,7 +1873,7 @@ app.post('/api/generate-preview', async (req, res) => {
 
   // ── Insert session row in DB (idempotent: INSERT OR IGNORE) ───────────────
   try {
-    db.insertSession(calculation_id, partner1, partner2, compat, quizContext);
+    db.insertSession(calculation_id, partner1, partner2, compat, quizContext, mode);
     console.log('[db] Session inserted for calculation_id:', calculation_id);
   } catch (dbErr) {
     console.error('[generate-preview] DB insert error:', dbErr.message);
@@ -1302,7 +1892,7 @@ app.post('/api/generate-preview', async (req, res) => {
     }
   }
 
-  // -- Our own campaign label ----------------------------------------------
+  // ── Our own campaign label ────────────────────────────────────────────────
   // Same treatment, separate column: this one identifies the reel or post the
   // visitor came from and is only ever read back by our own admin panel.
   const cleanSrc = traffic.sanitizeSource(src);
@@ -1319,7 +1909,7 @@ app.post('/api/generate-preview', async (req, res) => {
   if (!generatedResults[calculation_id]) {
     generatedResults[calculation_id] = {
       calculationId: calculation_id,
-      _partnerData:  { partner1: partner1 || {}, partner2: partner2 || {}, compatibility: compat, quizContext: quizContext || [] },
+      _partnerData:  { partner1: partner1 || {}, partner2: partner2 || {}, compatibility: compat, quizContext: quizContext || [], mode: mode === 'famiglia' ? 'famiglia' : 'coppia' },
       payment: {
         status:          'pending',
         paymentIntentId: null,
@@ -1404,6 +1994,7 @@ app.post('/api/generate-consultation', async (req, res) => {
             partner2:      { name: row.partner2_name, gender: row.partner2_gender, birthDate: row.partner2_birth },
             compatibility: compat,
             quizContext:   row.quiz_context_json ? JSON.parse(row.quiz_context_json) : [],
+            mode:          row.mode || 'coppia',
           },
           payment:       { status: row.payment_status, accessToken: row.access_token },
           preview,
@@ -1614,9 +2205,13 @@ const nodemailer = require('nodemailer');
 
 const SITE_URL = process.env.SITE_URL || 'https://lignaggio.it';
 
+// Fiamme Gemelle adds four keys for the couple funnel. A parent-and-child
+// reading never has them, and _buildConsultBody skips whatever is absent, so
+// one order serves both.
 const CONSULT_SECTION_ORDER = [
   'panorama','partner1','partner2','couple',
-  'anima','karma','intimita','finanze','potentiale','consiglio',
+  'anima','karma','intimita','finanze','potentiale',
+  'fiamma1','fiamma2','unione','passi','consiglio',
 ];
 const CONSULT_SECTION_TITLES = {
   panorama:   'Panorama della coppia',
@@ -1628,6 +2223,10 @@ const CONSULT_SECTION_TITLES = {
   intimita:   'Intimità',
   finanze:    'Finanze e valori materiali',
   potentiale: 'Potenziale evolutivo',
+  fiamma1:    'La fiamma di {p1}',
+  fiamma2:    'La fiamma di {p2}',
+  unione:     'Il legame fra voi due',
+  passi:      'Piano di riavvicinamento',
   consiglio:  'Consiglio',
 };
 
@@ -1701,8 +2300,25 @@ async function sendConsultationEmail(calculationId, consultation, partnerData) {
   const score  = compat.compatibilityScore != null ? compat.compatibilityScore + '%' : null;
 
   const resultUrl = SITE_URL + '/result-unlocked.html?cid=' + encodeURIComponent(calculationId);
+  const giftUrl   = SITE_URL + '/bonus.html?cid=' + encodeURIComponent(calculationId);
   const bodyHtml  = _buildConsultBody(consultation, p1Name, p2Name);
   const bonusCode = db.getBonusCode(calculationId);
+
+  // The gift lives on the site, not in this email: choosing a lens is the
+  // action that brings the buyer back, and it can only be made once.
+  const giftBlock = `
+        <div style="margin:28px 0;padding:22px 24px;background:linear-gradient(155deg,#2a1d05 0%,#1a1207 100%);border-radius:10px;border:1px solid rgba(232,201,106,0.42);text-align:center">
+          <p style="margin:0 0 8px 0;color:#e8c96a;font-size:12px;letter-spacing:0.22em;text-transform:uppercase">✦ Il vostro regalo</p>
+          <p style="margin:0 0 10px 0;font-size:20px;font-weight:700;color:#fff">Analisi Focus</p>
+          <p style="margin:0 0 18px 0;color:#d8cfa8;font-size:14px;line-height:1.6">
+            Scegliete un tema — intimità, finanze, karma o anima — e riceverete un secondo
+            approfondimento scritto solo per voi, con tre esercizi da fare insieme.
+            <br><span style="color:#a99a72;font-size:12px">Non è compreso nel prezzo della consulenza.</span>
+          </p>
+          <a href="${giftUrl}" style="background:#e8c96a;color:#1a1207;padding:12px 28px;border-radius:6px;text-decoration:none;font-weight:700">
+            Apri il regalo ✦
+          </a>
+        </div>`;
 
   const bonusBlock = bonusCode ? `
         <div style="margin:28px 0;padding:20px 24px;background:linear-gradient(135deg,#1e0533 0%,#3b0764 100%);border-radius:10px;border:1px solid rgba(167,139,250,0.3);text-align:center">
@@ -1722,13 +2338,19 @@ async function sendConsultationEmail(calculationId, consultation, partnerData) {
         <hr style="border:0;border-top:1px solid #e5e7eb;margin:24px 0">
         ${bodyHtml}
         <hr style="border:0;border-top:1px solid #e5e7eb;margin:24px 0">
+        ${giftBlock}
         ${bonusBlock}
         <p style="text-align:center;margin-top:24px">
           <a href="${resultUrl}" style="background:#6b21a8;color:#fff;padding:12px 28px;border-radius:6px;text-decoration:none;font-weight:600">
             Visualizza la consulenza online ✦
           </a>
         </p>
-        <p style="margin-top:32px;font-size:12px;color:#999;text-align:center">
+        <p style="margin-top:28px;font-size:13px;color:#666;text-align:center">
+          Per ritrovare questa lettura più avanti, aprite
+          <a href="${SITE_URL.replace(/\/$/, '')}/spazio.html" style="color:#6b21a8;font-weight:600">il vostro Spazio</a>
+          — basta questa email, nessuna password.
+        </p>
+        <p style="margin-top:24px;font-size:12px;color:#999;text-align:center">
           © Quiz Test di Compatibilità dei Partner · lignaggio.it
         </p>
       </div>
@@ -1810,6 +2432,159 @@ async function checkAbandonedSessions() {
 }
 
 setInterval(checkAbandonedSessions, 5 * 60 * 1000); // every 5 minutes
+
+// =====================================================
+// RITUALE DEI 7 GIORNI
+//
+// One exercise a day for a week, taken from the `esercizi` the model already
+// wrote alongside the consultation. No new completions: the whole sequence is
+// paid for by the single generation the buyer already triggered.
+// =====================================================
+
+const RITUAL_INTERVAL_MS  = 24 * 60 * 60 * 1000;  // one exercise per day
+const RITUAL_SWEEP_MS     = 30 * 60 * 1000;       // check for due exercises twice an hour
+const RITUAL_MAX_PER_RUN  = 25;
+
+/**
+ * Adds a buyer to the seven-day sequence, starting tomorrow.
+ *
+ * Silently does nothing when there is no address on file or the reading came
+ * back without exercises — the sequence has nothing to send in that case.
+ *
+ * @param {string} calculationId
+ * @param {object} consultation
+ */
+function enrolBuyerInRitual(calculationId, consultation) {
+  if (!Array.isArray(consultation && consultation.esercizi) || consultation.esercizi.length === 0) {
+    return;
+  }
+  const emailRow = db.getSessionEmail(calculationId);
+  if (!emailRow || !emailRow.email) { return; }
+
+  const created = db.enrolInRitual(calculationId, emailRow.email, Date.now() + RITUAL_INTERVAL_MS);
+  if (created) {
+    console.log('[ritual] Enrolled', calculationId, '— first exercise in 24h');
+  }
+}
+
+/**
+ * Builds and sends one day of the ritual.
+ * @param {{calculation_id: string, email: string, next_day: number}} row
+ * @returns {Promise<boolean>} true when an email went out
+ */
+async function sendRitualDay(row) {
+  const cid  = row.calculation_id;
+  const day  = row.next_day;
+
+  const consultRow = db.getConsultation(cid);
+  const consultation = consultRow ? safeParseJson(consultRow.consultation_json) : null;
+  const exercises = (consultation && consultation.esercizi) || [];
+
+  const exercise = exercises[day - 1];
+  if (!exercise) {
+    // Nothing to send for this day — retire the row rather than retrying forever.
+    db.unsubscribeFromRitual(cid);
+    return false;
+  }
+
+  const session = db.getSession(cid);
+  const p1 = (session && session.partner1_name) || '';
+  const p2 = (session && session.partner2_name) || '';
+  const couple = p1 && p2 ? `${escapeHtml(p1)} e ${escapeHtml(p2)}` : 'voi due';
+
+  const stopUrl = SITE_URL.replace(/\/$/, '') +
+    '/api/ritual/stop?cid=' + encodeURIComponent(cid) +
+    '&t=' + encodeURIComponent((session && session.access_token) || '');
+  const resultUrl = SITE_URL + '/result-unlocked.html?cid=' + encodeURIComponent(cid);
+
+  const html = `
+    <div style="font-family:sans-serif;max-width:620px;margin:auto;color:#222;line-height:1.6">
+      <div style="background:linear-gradient(135deg,#2a1d05 0%,#1a1207 100%);padding:26px 32px;border-radius:8px 8px 0 0">
+        <p style="margin:0 0 6px 0;color:#e8c96a;font-size:11px;letter-spacing:0.22em;text-transform:uppercase">
+          Rituale dei 7 giorni · Giorno ${day}
+        </p>
+        <p style="margin:0;color:#fff;font-size:21px;font-weight:700">${escapeHtml(exercise.titolo)}</p>
+      </div>
+      <div style="background:#fff;padding:30px 32px;border:1px solid #e5e7eb;border-top:0;border-radius:0 0 8px 8px">
+        <p>Buongiorno ${couple},</p>
+        <p style="color:#666;font-size:14px">
+          L'esercizio di oggi arriva dalla vostra consulenza${exercise.sezione ? ' — sezione <strong>' + escapeHtml(exercise.sezione) + '</strong>' : ''}.
+          ${exercise.durata ? 'Servono <strong>' + escapeHtml(exercise.durata) + '</strong>.' : ''}
+        </p>
+        <div style="margin:22px 0;padding:20px 22px;background:#faf6ea;border-left:3px solid #e8c96a;border-radius:0 8px 8px 0">
+          <p style="margin:0;font-size:15px;line-height:1.7;color:#3a3320">${escapeHtml(exercise.testo)}</p>
+        </div>
+        <p style="text-align:center;margin-top:26px">
+          <a href="${resultUrl}" style="background:#6b21a8;color:#fff;padding:11px 26px;border-radius:6px;text-decoration:none;font-weight:600">
+            Rileggi la consulenza ✦
+          </a>
+        </p>
+        <p style="margin-top:30px;font-size:11px;color:#999;text-align:center">
+          Giorno ${day} di ${db.RITUAL_TOTAL_DAYS} ·
+          <a href="${stopUrl}" style="color:#999">non voglio più ricevere questi esercizi</a>
+        </p>
+      </div>
+    </div>`;
+
+  await sendEmail({
+    to:      row.email,
+    subject: `Giorno ${day} · ${exercise.titolo}`,
+    html,
+  });
+
+  return true;
+}
+
+/**
+ * Sends every exercise that has come due and schedules the following one.
+ */
+async function sweepRitual() {
+  if (!process.env.SMTP_USER || !process.env.SMTP_PASS) { return; }
+  try {
+    const due = db.getRitualDue(RITUAL_MAX_PER_RUN);
+    for (const row of due) {
+      try {
+        const sent = await sendRitualDay(row);
+        if (sent) {
+          db.advanceRitual(row.calculation_id, Date.now() + RITUAL_INTERVAL_MS);
+          console.log('[ritual] Day', row.next_day, 'sent for', row.calculation_id);
+        }
+      } catch (err) {
+        // Leave next_send_at alone so the same day is retried on the next sweep.
+        console.error('[ritual] Send failed for', row.calculation_id, err.message);
+      }
+    }
+  } catch (err) {
+    console.error('[ritual] sweep error:', err.message);
+  }
+}
+
+setInterval(sweepRitual, RITUAL_SWEEP_MS);
+
+// GET /api/ritual/stop?cid=…&t=… — one-click unsubscribe from the email footer.
+app.get('/api/ritual/stop', function (req, res) {
+  const cid   = String(req.query.cid || '').trim();
+  const token = String(req.query.t   || '').trim();
+
+  const session = cid ? db.getSession(cid) : null;
+  const ok = session && session.access_token && token && session.access_token === token;
+
+  if (ok) { db.unsubscribeFromRitual(cid); }
+
+  // Always a friendly page: an unsubscribe link that answers with an error is
+  // worse than one that quietly does nothing.
+  res.set('Content-Type', 'text/html; charset=utf-8').send(`<!DOCTYPE html>
+<html lang="it"><head><meta charset="utf-8"><title>Rituale interrotto</title></head>
+<body style="font-family:sans-serif;background:#0f0820;color:#e9e2f7;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
+  <div style="text-align:center;max-width:420px;padding:32px">
+    <p style="color:#e8c96a;letter-spacing:0.2em;font-size:11px;text-transform:uppercase">Rituale dei 7 giorni</p>
+    <h1 style="font-size:22px;font-weight:700;margin:12px 0">${ok ? 'Non riceverete più gli esercizi' : 'Nessun esercizio in programma'}</h1>
+    <p style="color:#b3a8cc;font-size:14px;line-height:1.6">
+      La vostra consulenza resta disponibile e gli esercizi sono già dentro il PDF che avete scaricato.
+    </p>
+  </div>
+</body></html>`);
+});
 
 // =====================================================
 // DELIVERY RECONCILIATION — every paid order gets its reading
@@ -2058,6 +2833,333 @@ app.get('/api/admin/sessions', adminAuth, function (req, res) {
   } catch (err) {
     console.error('[admin/sessions]', err.message);
     res.status(500).json({ success: false, error: 'server_error' });
+  }
+});
+
+// =====================================================
+// IL TUO SPAZIO — every calculation an address ever made
+//
+// No passwords and no accounts: a link arrives by email, the browser trades it
+// for a token it keeps, and that token lists the orders placed with that
+// address. The address is already the identity everywhere else in this system.
+// =====================================================
+
+const SPACE_MAGIC_TTL_MS  = 30 * 60 * 1000;             // the link in the inbox
+const SPACE_ACCESS_TTL_MS = 90 * 24 * 60 * 60 * 1000;   // the token in the browser
+
+/**
+ * @returns {string} a token with enough entropy to be unguessable
+ */
+function newSpaceToken() {
+  return crypto.randomBytes(24).toString('base64url');
+}
+
+/**
+ * Reads and validates the access token a request carries.
+ * @param {import('express').Request} req
+ * @returns {string|null} the email, or null
+ */
+function spaceEmailFor(req) {
+  const header = String(req.headers['x-space-token'] || '').trim();
+  const query  = String(req.query.token || '').trim();
+  const token  = header || query;
+  if (!token) { return null; }
+  return db.readSpaceToken(token, 'access');
+}
+
+// POST /api/space/request-link { email } — send the way in.
+app.post('/api/space/request-link', async function (req, res) {
+  const email = String((req.body && req.body.email) || '').trim().toLowerCase();
+
+  if (!EMAIL_RE.test(email) || email.length > 200) {
+    return res.status(400).json({ success: false, error: 'invalid_email' });
+  }
+
+  // The answer never says whether that address has anything here: it would turn
+  // this endpoint into a way of asking who bought what.
+  const reply = { success: true, sent: true };
+
+  try {
+    const sessions = db.getSpaceSessions(email);
+    if (sessions.length === 0) {
+      console.log('[space] Link requested for an address with no orders — nothing sent.');
+      return res.json(reply);
+    }
+
+    const token = newSpaceToken();
+    db.saveSpaceToken(token, email, 'magic', SPACE_MAGIC_TTL_MS);
+
+    const url = SITE_URL.replace(/\/$/, '') + '/spazio.html?t=' + encodeURIComponent(token);
+
+    await sendEmail({
+      to:      email,
+      subject: 'Il tuo Spazio — ecco il link per entrare',
+      html: `
+        <div style="font-family:sans-serif;max-width:560px;margin:auto;color:#222;line-height:1.6">
+          <div style="background:linear-gradient(135deg,#1e0533 0%,#3b0764 100%);padding:26px 32px;border-radius:8px 8px 0 0">
+            <p style="margin:0 0 6px 0;color:#c4b5fd;font-size:11px;letter-spacing:0.22em;text-transform:uppercase">Il tuo Spazio</p>
+            <p style="margin:0;color:#fff;font-size:21px;font-weight:700">Le vostre letture, tutte insieme</p>
+          </div>
+          <div style="background:#fff;padding:30px 32px;border:1px solid #e5e7eb;border-top:0;border-radius:0 0 8px 8px">
+            <p>Questo link apre il vostro spazio: le analisi che avete fatto, i PDF e il regalo.</p>
+            <p style="text-align:center;margin:26px 0">
+              <a href="${url}" style="background:#6b21a8;color:#fff;padding:13px 30px;border-radius:6px;text-decoration:none;font-weight:600">
+                Entra nel mio Spazio ✦
+              </a>
+            </p>
+            <p style="font-size:12px;color:#999">
+              Il link vale 30 minuti e si può usare una volta sola. Se non l'avete richiesto voi,
+              ignorate questa email: senza il link non si entra.
+            </p>
+          </div>
+        </div>`,
+    });
+
+    console.log('[space] Magic link sent to an address with', sessions.length, 'orders.');
+  } catch (err) {
+    console.error('[space] request-link error:', err.message);
+  }
+
+  res.json(reply);
+});
+
+// GET /api/space/session?t=… — trade the emailed link for a lasting token.
+app.get('/api/space/session', function (req, res) {
+  const magic = String(req.query.t || '').trim();
+  if (!magic) { return res.status(400).json({ success: false, error: 'missing_token' }); }
+
+  const email = db.readSpaceToken(magic, 'magic');
+  if (!email || !db.consumeSpaceToken(magic)) {
+    return res.status(401).json({ success: false, error: 'link_expired' });
+  }
+
+  const access = newSpaceToken();
+  db.saveSpaceToken(access, email, 'access', SPACE_ACCESS_TTL_MS);
+
+  console.log('[space] Access granted.');
+  res.json({ success: true, token: access, email });
+});
+
+// GET /api/space/list — the orders behind the token.
+app.get('/api/space/list', function (req, res) {
+  const email = spaceEmailFor(req);
+  if (!email) { return res.status(401).json({ success: false, error: 'not_signed_in' }); }
+
+  const rows = db.getSpaceSessions(email);
+
+  const calculations = rows.map(function (row) {
+    const compat = safeParseJson(row.compatibility_json) || {};
+    return {
+      calculationId: row.id,
+      partner1:      row.partner1_name  || '',
+      partner2:      row.partner2_name  || '',
+      partner1Birth: row.partner1_birth || '',
+      partner2Birth: row.partner2_birth || '',
+      score:         compat.compatibilityScore || null,
+      dimensions:    compat.dimensions || null,
+      archetype:     compat.compatibilityArchetype || null,
+      paid:          row.payment_status === 'paid',
+      ready:         row.has_consultation > 0,
+      giftFocus:     row.bonus_focus  || null,
+      giftStatus:    row.bonus_status || 'idle',
+      createdAt:     row.created_at,
+    };
+  });
+
+  res.json({
+    success: true,
+    email,
+    calculations,
+    waitlist: !!db.getNatalWaitlistEntry(email),
+  });
+});
+
+// POST /api/space/waitlist — tell us you want the Carta Natale.
+app.post('/api/space/waitlist', function (req, res) {
+  const email = spaceEmailFor(req);
+  if (!email) { return res.status(401).json({ success: false, error: 'not_signed_in' }); }
+
+  const body = req.body || {};
+  const clean = function (v, max) { return String(v || '').trim().slice(0, max); };
+
+  try {
+    db.addToNatalWaitlist({
+      email,
+      birthDate:  clean(body.birthDate, 20),
+      birthTime:  clean(body.birthTime, 10),
+      birthPlace: clean(body.birthPlace, 120),
+    });
+    console.log('[space] Added to the Carta Natale waitlist.');
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[space] waitlist error:', err.message);
+    res.status(500).json({ success: false, error: 'server_error' });
+  }
+});
+
+// ── Analisi Focus routes ────────────────────────────────────────────────────
+
+/**
+ * One extra lens costs the same as the entry tier and is billed through the
+ * Price that already exists in Stripe for it — no second product to keep in
+ * sync, and the amount stays defined in one place (the Stripe dashboard).
+ */
+const EXTRA_LENS_PRICE_KEY = '1.59';
+const EXTRA_LENS_PRICE_EUR = 1.59;
+//
+// The gift is tied to the order, not to an account: knowing the calculation id
+// and having paid for it is the whole authorisation model, exactly as for
+// GET /api/report/:calculation_id.
+
+/**
+ * Reads the paid session behind a calculation id.
+ * @returns {{row: object}|{error: number, body: object}}
+ */
+function requirePaidSession(calculationId) {
+  if (!calculationId) {
+    return { error: 400, body: { success: false, error: 'missing_cid' } };
+  }
+  const row = db.getSession(calculationId);
+  if (!row) {
+    return { error: 404, body: { success: false, error: 'not_found' } };
+  }
+  if (row.payment_status !== 'paid') {
+    return { error: 402, body: { success: false, error: 'payment_required' } };
+  }
+  return { row };
+}
+
+// GET /api/bonus?cid=… — current state of the gift for this order.
+app.get('/api/bonus', function (req, res) {
+  const cid   = String(req.query.cid || '').trim();
+  const guard = requirePaidSession(cid);
+  if (guard.error) { return res.status(guard.error).json(guard.body); }
+
+  const state = db.getBonusAnalysis(cid) || { focus: null, status: 'idle', bonus: null };
+  const extra = db.listExtraBonuses(cid);
+  const taken = new Set([state.focus].concat(extra.map(function (e) { return e.focus; })));
+
+  res.json({
+    success: true,
+    status:  state.status,          // idle | generating | ready
+    focus:   state.focus,
+    lenses:  Object.keys(BONUS_FOCUS_LENSES).map(function (key) {
+      return { key, label: BONUS_FOCUS_LENSES[key].label };
+    }),
+    bonus:   state.status === 'ready' ? state.bonus : null,
+
+    // Lenses already bought, and the ones still on offer.
+    extra,
+    available: Object.keys(BONUS_FOCUS_LENSES)
+      .filter(function (key) { return !taken.has(key); })
+      .map(function (key) { return { key, label: BONUS_FOCUS_LENSES[key].label }; }),
+    extraPrice: EXTRA_LENS_PRICE_EUR,
+  });
+});
+
+// POST /api/bonus/choose { cid, focus } — claim a lens and start generating.
+app.post('/api/bonus/choose', function (req, res) {
+  const cid   = String((req.body && req.body.cid)   || '').trim();
+  const focus = String((req.body && req.body.focus) || '').trim().toLowerCase();
+
+  const guard = requirePaidSession(cid);
+  if (guard.error) { return res.status(guard.error).json(guard.body); }
+
+  if (!BONUS_FOCUS_LENSES[focus]) {
+    return res.status(400).json({ success: false, error: 'unknown_focus' });
+  }
+
+  const claim = db.claimBonusFocus(cid, focus);
+
+  // Already claimed: report the existing gift rather than starting a second one.
+  if (!claim.claimed) {
+    const state = db.getBonusAnalysis(cid);
+    // A generation that died mid-flight leaves 'generating' with no JSON —
+    // restart it for the lens the buyer already chose.
+    if (state && state.status === 'generating' && !state.bonus) {
+      generateBonusFocus(cid, state.focus).catch(function () {});
+    }
+    return res.json({
+      success:       true,
+      alreadyChosen: true,
+      focus:         claim.focus,
+      status:        state ? state.status : 'generating',
+    });
+  }
+
+  console.log('[bonus] Lens claimed:', focus, 'for', cid);
+  generateBonusFocus(cid, focus).catch(function (err) {
+    console.error('[bonus] Unhandled generation error:', err.message);
+  });
+
+  res.json({ success: true, alreadyChosen: false, focus, status: 'generating' });
+});
+
+// ── Buying one more lens ────────────────────────────────────────────────────
+//
+// Stripe Checkout, not the card form used in the funnel: this is a small
+// follow-up purchase by somebody who already paid, and a hosted page keeps it
+// completely separate from the checkout that must never break.
+
+app.post('/api/bonus/purchase', async function (req, res) {
+  const cid   = String((req.body && req.body.cid)   || '').trim();
+  const focus = String((req.body && req.body.focus) || '').trim().toLowerCase();
+
+  const guard = requirePaidSession(cid);
+  if (guard.error) { return res.status(guard.error).json(guard.body); }
+
+  const lens = BONUS_FOCUS_LENSES[focus];
+  if (!lens) {
+    return res.status(400).json({ success: false, error: 'unknown_focus' });
+  }
+
+  // The gift lens is already theirs; selling it again would be taking money for
+  // something they own.
+  const gift = db.getBonusAnalysis(cid);
+  if (gift && gift.focus === focus) {
+    return res.status(409).json({ success: false, error: 'already_owned' });
+  }
+
+  const owned = db.getExtraBonus(cid, focus);
+  if (owned && owned.status !== 'pending') {
+    return res.status(409).json({ success: false, error: 'already_owned' });
+  }
+
+  const stripePriceId = PRICE_MAP[EXTRA_LENS_PRICE_KEY];
+  if (!stripePriceId) {
+    console.error('[bonus] PRICE_159_ID is not configured — cannot sell an extra lens.');
+    return res.status(500).json({ success: false, error: 'price_not_configured' });
+  }
+
+  try {
+    const site = SITE_URL.replace(/\/$/, '');
+    const session = await stripe.checkout.sessions.create({
+      mode: 'payment',
+      // The Price the funnel already uses for its entry tier. Reusing it means
+      // there is one product in Stripe, one amount to change, and the reports
+      // in the dashboard stay comparable.
+      line_items: [{ price: stripePriceId, quantity: 1 }],
+      // The line item shows the existing product name, so the lens the buyer
+      // chose is named here instead.
+      custom_text: {
+        submit: { message: 'Analisi Focus — ' + lens.label + '. Cinque capitoli e tre esercizi per voi due.' },
+      },
+      // `product` is what the webhook keys on. `selected_price` is deliberately
+      // absent: that field drives the auto-subscription rule, and a follow-up
+      // purchase must never start a subscription.
+      metadata: { calculation_id: cid, bonus_focus: focus, product: 'bonus_focus' },
+      success_url: site + '/bonus.html?cid=' + encodeURIComponent(cid) + '&acquistata=' + focus,
+      cancel_url:  site + '/bonus.html?cid=' + encodeURIComponent(cid),
+    });
+
+    db.startExtraPurchase(cid, focus, session.id);
+    console.log('[bonus] Checkout opened for', cid, '— lens:', focus);
+
+    res.json({ success: true, url: session.url });
+
+  } catch (err) {
+    console.error('[bonus] Checkout creation failed:', err.message);
+    res.status(500).json({ success: false, error: 'checkout_failed' });
   }
 });
 
@@ -2365,6 +3467,20 @@ app.get('/api/admin/stats/attribution', adminAuth, function (req, res) {
   }
 });
 
+// ── GET /api/admin/stats/sources — our own labelled traffic, per campaign ───
+// One row per ?src= label: clicks on arrival, quizzes finished, sales, revenue.
+// Independent of cookie consent, of ad blockers and of the partner's tracker,
+// which is what makes it the figure worth showing a partner.
+app.get('/api/admin/stats/sources', adminAuth, function (req, res) {
+  const days = Math.min(365, Math.max(1, parseInt(req.query.days, 10) || 30));
+  try {
+    res.json(db.getStatsSources(days * 24 * 60 * 60 * 1000));
+  } catch (err) {
+    console.error('[admin/stats/sources]', err.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
 // ── GET /api/admin/stats/google — GA4 numbers for the quiz only ─────────────
 // Reads Google Analytics from our own panel so the owner does not have to open
 // the GA interface. GA problems are returned as data, never as a 500, because
@@ -2375,20 +3491,6 @@ app.get('/api/admin/stats/google', adminAuth, async function (req, res) {
     res.json(await googleAnalytics.getQuizReport({ days }));
   } catch (err) {
     console.error('[admin/stats/google]', err.message);
-    res.status(500).json({ error: 'server_error' });
-  }
-});
-
-// -- GET /api/admin/stats/sources - our own labelled traffic, per campaign --
-// One row per ?src= label: clicks on arrival, quizzes finished, sales,
-// revenue. Independent of cookie consent, of ad blockers and of the
-// partner's tracker, which is what makes it worth showing a partner.
-app.get('/api/admin/stats/sources', adminAuth, function (req, res) {
-  const days = Math.min(365, Math.max(1, parseInt(req.query.days, 10) || 30));
-  try {
-    res.json(db.getStatsSources(days * 24 * 60 * 60 * 1000));
-  } catch (err) {
-    console.error('[admin/stats/sources]', err.message);
     res.status(500).json({ error: 'server_error' });
   }
 });

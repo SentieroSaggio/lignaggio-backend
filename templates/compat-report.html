@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="UTF-8"/>
+<title>Consulenza di Compatibilità — {{P1_NAME}} & {{P2_NAME}}</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Hahmlet:wght@400;600;700;800&family=Sora:wght@300;400;600;700;800&family=Inter:ital,wght@0,300;0,400;1,300&display=swap');
+
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0;hyphens:none;word-break:normal;overflow-wrap:break-word}
+
+/* ── Design tokens ──────────────────────────────────────────
+   Same roles as the ASTREA natal report, repainted in the
+   funnel's own palette: violet where that one is orange, and
+   gold kept for the one thing that is a gift.
+   ─────────────────────────────────────────────────────────── */
+:root{
+  --bg:#0F0820;--bg2:#160D28;
+  --accent:#C78AFF;      /* lavender — the funnel's signature */
+  --gold:#E8C96A;--gold2:#F5E09A;
+  --lav:#B46AFF;
+  --purple:#6F4DFF;
+  --pink:#FF8DE8;
+  --text:#FFF;--text2:rgba(240,234,255,0.84);--text3:rgba(226,216,248,0.52);
+  --card:rgba(255,255,255,0.05);--border:rgba(255,255,255,0.10);
+  --abg:rgba(199,138,255,0.09);--aborder:rgba(199,138,255,0.30);
+  --gbg:rgba(232,201,106,0.08);--gborder:rgba(232,201,106,0.30);
+  --lbg:rgba(111,77,255,0.10);--lborder:rgba(111,77,255,0.28);
+  --W:794px;--H:1123px
+}
+
+html,body{background:#07030F;font-family:'Sora',system-ui,sans-serif;color:var(--text)}
+
+/* ── Print bar (screen only) ── */
+.print-bar{position:sticky;top:0;z-index:999;background:rgba(7,3,15,0.95);border-bottom:1px solid var(--border);padding:13px 32px;display:flex;align-items:center;justify-content:space-between;backdrop-filter:blur(12px)}
+.print-btn{background:linear-gradient(135deg,var(--gold),#B8860B);color:#160D28;border:none;border-radius:10px;padding:10px 26px;font-size:17px;font-weight:700;font-family:'Sora',sans-serif;cursor:pointer;box-shadow:0 4px 16px rgba(232,201,106,0.35)}
+.pb-title{font-family:'Hahmlet',serif;font-size:24px;font-weight:700;color:var(--accent);filter:drop-shadow(0 0 8px rgba(199,138,255,0.5))}
+.pb-sub{font-size:15px;color:var(--text3);margin-top:1px}
+
+/* ── Page ── */
+.pages{display:flex;flex-direction:column;align-items:center;gap:24px;padding:28px 0 60px}
+.page{width:var(--W);min-height:var(--H);background:var(--bg);position:relative;overflow:hidden;page-break-after:always;break-after:page;-webkit-print-color-adjust:exact;print-color-adjust:exact;box-shadow:0 0 60px rgba(111,77,255,0.10),0 20px 60px rgba(0,0,0,0.5)}
+.page:last-child{page-break-after:auto;break-after:auto}
+.page-bg{position:absolute;inset:0;z-index:0;background:
+  radial-gradient(circle at 18% 12%, rgba(111,77,255,0.20) 0%, transparent 55%),
+  radial-gradient(circle at 86% 88%, rgba(255,141,232,0.10) 0%, transparent 55%),
+  linear-gradient(170deg,#160D28 0%,#0F0820 45%,#0B0518 100%)}
+.blob{position:absolute;border-radius:50%;filter:blur(90px);pointer-events:none;z-index:0}
+.pg{position:relative;z-index:1;padding:48px 58px;min-height:var(--H);display:flex;flex-direction:column}
+
+/* ── Topbar / footer ── */
+.topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:36px}
+.logo-w{display:flex;align-items:center;gap:9px}
+.logo-glyph{font-size:22px;color:var(--accent);filter:drop-shadow(0 0 10px rgba(199,138,255,0.6))}
+.logo-t{font-family:'Hahmlet',serif;font-weight:700;font-size:22px;letter-spacing:1px;color:var(--accent);filter:drop-shadow(0 0 10px rgba(199,138,255,0.45))}
+.tag{font-family:'Sora',sans-serif;font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:2px;border-radius:20px;padding:5px 14px;border:1px solid var(--border);color:var(--text3)}
+.tag-a{color:var(--accent);border-color:var(--aborder);background:var(--abg);box-shadow:0 0 14px rgba(199,138,255,0.28),inset 0 0 14px rgba(199,138,255,0.04);text-shadow:0 0 8px rgba(199,138,255,0.6)}
+.tag-g{color:var(--gold);border-color:var(--gborder);background:var(--gbg);box-shadow:0 0 14px rgba(232,201,106,0.32),inset 0 0 14px rgba(232,201,106,0.04);text-shadow:0 0 8px rgba(232,201,106,0.6)}
+.tag-l{color:var(--lav);border-color:var(--lborder);background:var(--lbg);box-shadow:0 0 14px rgba(111,77,255,0.38),inset 0 0 14px rgba(111,77,255,0.05);text-shadow:0 0 8px rgba(111,77,255,0.6)}
+.pf{margin-top:auto;padding-top:20px;display:flex;align-items:center;justify-content:space-between;border-top:1px solid rgba(255,255,255,0.07)}
+
+/* ── Type scale ── */
+.h1{font-family:'Hahmlet',serif;font-weight:800;font-size:72px;line-height:1.05;letter-spacing:-.5px}
+.h2{font-family:'Hahmlet',serif;font-weight:700;font-size:50px;line-height:1.1}
+.h3{font-family:'Hahmlet',serif;font-weight:700;font-size:32px;line-height:1.2}
+.h4{font-family:'Hahmlet',serif;font-weight:700;font-size:26px;line-height:1.25}
+.sec-title{font-family:'Hahmlet',serif;font-weight:700;font-size:44px;line-height:1.1;margin-bottom:4px}
+.sec-sub{font-family:'Sora',sans-serif;font-size:14px;font-weight:700;text-transform:uppercase;letter-spacing:2.5px;color:var(--text3);margin-bottom:22px}
+.body{font-family:'Inter',sans-serif;font-weight:300;font-size:18px;line-height:1.78;color:var(--text2);margin-bottom:14px}
+.body:last-child{margin-bottom:0}
+.body-sm{font-family:'Inter',sans-serif;font-weight:300;font-size:16px;line-height:1.72;color:var(--text2)}
+.label{font-family:'Sora',sans-serif;font-size:17px;font-weight:700;text-transform:uppercase;letter-spacing:2px}
+.cap{font-family:'Sora',sans-serif;font-size:14px;color:var(--text3)}
+
+/* ── Gradient text ── */
+.gt{background:linear-gradient(135deg,var(--accent),var(--pink));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;filter:drop-shadow(0 0 10px rgba(199,138,255,0.4)) drop-shadow(0 0 24px rgba(255,141,232,0.2))}
+.gl{background:linear-gradient(135deg,var(--lav),#D8B4FF);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;filter:drop-shadow(0 0 10px rgba(111,77,255,0.5))}
+.gg{background:linear-gradient(135deg,var(--gold),#F5E4B8);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;filter:drop-shadow(0 0 10px rgba(232,201,106,0.5))}
+.c-a{color:var(--accent);text-shadow:0 0 12px rgba(199,138,255,0.55)}
+.c-g{color:var(--gold);text-shadow:0 0 12px rgba(232,201,106,0.55)}
+.c-l{color:var(--lav);text-shadow:0 0 12px rgba(111,77,255,0.55)}
+.c-m{color:var(--text3)}.c-w{color:#fff}
+.w7{font-weight:700}.w6{font-weight:600}
+
+/* ── Dividers ── */
+.div{height:2px;width:44px;border-radius:2px;margin-bottom:16px}
+.da{background:linear-gradient(90deg,var(--accent),transparent);box-shadow:0 0 8px rgba(199,138,255,0.5)}
+.dg{background:linear-gradient(90deg,var(--gold),transparent);box-shadow:0 0 8px rgba(232,201,106,0.5)}
+.dl{background:linear-gradient(90deg,var(--lav),transparent);box-shadow:0 0 8px rgba(111,77,255,0.5)}
+
+/* ── Cards ── */
+.card{background:linear-gradient(135deg,rgba(107,44,247,0.09),rgba(81,51,114,0.05),rgba(193,84,193,0.05));border:1px solid rgba(255,255,255,0.13);border-radius:14px;padding:18px 22px;backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);box-shadow:0 2px 2px rgba(20,10,35,0.55),0 4px 16px rgba(0,0,0,0.32),0 12px 40px rgba(0,0,0,0.22),inset 0 1px 0 rgba(255,255,255,0.18),inset 0 -1px 0 rgba(0,0,0,0.24)}
+.card-a{background:var(--abg);border-color:var(--aborder);box-shadow:0 0 22px rgba(199,138,255,0.10),0 4px 24px rgba(0,0,0,0.2),inset 0 1px 0 rgba(199,138,255,0.10)}
+.card-g{background:var(--gbg);border-color:var(--gborder);box-shadow:0 0 22px rgba(232,201,106,0.10),0 4px 24px rgba(0,0,0,0.2),inset 0 1px 0 rgba(232,201,106,0.10)}
+.card-l{background:var(--lbg);border-color:var(--lborder);box-shadow:0 0 22px rgba(111,77,255,0.14),0 4px 24px rgba(0,0,0,0.2),inset 0 1px 0 rgba(111,77,255,0.10)}
+.quote{border-left:3px solid var(--accent);padding:12px 18px;background:var(--abg);border-radius:0 10px 10px 0;box-shadow:0 0 16px rgba(199,138,255,0.08)}
+.quote-g{border-left-color:var(--gold);background:var(--gbg);box-shadow:0 0 16px rgba(232,201,106,0.08)}
+.quote-l{border-left-color:var(--lav);background:var(--lbg);box-shadow:0 0 16px rgba(111,77,255,0.10)}
+
+/* ── Key message: where every section lands ── */
+.key-msg{border:2px solid var(--gold);background:linear-gradient(135deg,rgba(232,201,106,0.10),rgba(199,138,255,0.05));border-radius:16px;padding:20px 26px;margin-top:20px;box-shadow:0 0 30px rgba(232,201,106,0.12),0 0 80px rgba(232,201,106,0.05),inset 0 1px 0 rgba(232,201,106,0.12)}
+.km-title{font-family:'Sora',sans-serif;font-size:15px;font-weight:800;text-transform:uppercase;letter-spacing:2px;color:var(--gold);margin-bottom:10px;display:flex;align-items:center;justify-content:space-between;gap:12px;text-shadow:0 0 10px rgba(232,201,106,0.5)}
+.km-time{font-family:'Sora',sans-serif;font-size:13px;font-weight:700;letter-spacing:0;color:rgba(232,201,106,0.80);text-transform:none;white-space:nowrap}
+.km-name{font-family:'Hahmlet',serif;font-size:21px;font-weight:700;color:#fff;margin-bottom:8px}
+.km-text{font-family:'Inter',sans-serif;font-weight:300;font-size:17px;line-height:1.72;color:rgba(255,255,255,0.92)}
+
+/* ── Score ring (cover) ── */
+.ring-wrap{position:relative;width:230px;height:230px;flex-shrink:0}
+.ring-val{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center}
+.ring-num{font-family:'Hahmlet',serif;font-weight:800;font-size:62px;line-height:1;color:#fff}
+.ring-cap{font-family:'Sora',sans-serif;font-size:12px;font-weight:700;letter-spacing:3px;text-transform:uppercase;color:var(--text3);margin-top:6px}
+
+/* ── Dimension bars ── */
+.ebar-row{display:flex;align-items:center;gap:12px;margin-bottom:12px}
+.ebar-row:last-child{margin-bottom:0}
+.ebar-label{font-family:'Sora',sans-serif;font-size:16px;font-weight:600;width:110px;flex-shrink:0}
+.ebar-track{flex:1;height:7px;background:rgba(255,255,255,0.07);border-radius:4px;overflow:hidden}
+.ebar-fill{height:100%;border-radius:4px;background:linear-gradient(90deg,var(--purple),var(--pink));box-shadow:0 0 8px rgba(199,138,255,0.55)}
+.ebar-pct{font-family:'Sora',sans-serif;font-size:16px;font-weight:700;width:52px;text-align:right;flex-shrink:0;color:var(--accent)}
+
+/* ── Partner badges ── */
+.pair{display:flex;align-items:flex-start;justify-content:center;gap:26px}
+.pair-side{flex:1;text-align:center}
+.pair-name{font-family:'Hahmlet',serif;font-weight:700;font-size:26px;color:#fff;margin-bottom:8px}
+.pair-num{width:64px;height:64px;margin:0 auto 8px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-family:'Hahmlet',serif;font-weight:700;font-size:26px;color:var(--accent);background:var(--abg);border:1px solid var(--aborder);box-shadow:0 0 18px rgba(199,138,255,0.18)}
+.pair-arch{font-family:'Sora',sans-serif;font-size:14px;color:var(--text3)}
+.pair-birth{font-family:'Sora',sans-serif;font-size:13px;color:var(--text3);margin-top:4px}
+.pair-amp{font-family:'Hahmlet',serif;font-size:30px;color:var(--text3);padding-top:26px}
+
+/* ── Exercise list (dedicated page) ── */
+.ex-row{display:flex;gap:16px;padding:14px 0;border-bottom:1px solid rgba(255,255,255,0.07)}
+.ex-row:last-child{border-bottom:none}
+.ex-num{font-family:'Hahmlet',serif;font-weight:700;font-size:22px;color:var(--accent);width:42px;flex-shrink:0;text-align:center}
+.ex-name{font-family:'Hahmlet',serif;font-weight:700;font-size:19px;color:#fff;margin-bottom:4px}
+.ex-meta{font-family:'Sora',sans-serif;font-size:12px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;color:var(--gold);margin-bottom:6px}
+.ex-text{font-family:'Inter',sans-serif;font-weight:300;font-size:16px;line-height:1.68;color:var(--text2)}
+
+/* ── Gift page ── */
+.lens-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:22px 0}
+.lens-box{border:1px solid var(--gborder);background:var(--gbg);border-radius:12px;padding:14px 18px}
+.lens-name{font-family:'Hahmlet',serif;font-weight:700;font-size:20px;color:var(--gold);margin-bottom:4px}
+.lens-desc{font-family:'Inter',sans-serif;font-weight:300;font-size:14px;line-height:1.6;color:var(--text2)}
+.gift-link{font-family:'Sora',sans-serif;font-size:17px;font-weight:700;color:var(--gold2);word-break:break-all;text-align:center;display:block;margin-top:8px}
+
+@media print{
+  *{-webkit-print-color-adjust:exact!important;print-color-adjust:exact!important}
+  .print-bar{display:none!important}
+  .pages{padding:0;gap:0;background:none}
+  .page{box-shadow:none;margin:0;min-height:0!important}
+  .pg{min-height:0!important}
+  .card,.card-a,.card-g,.card-l{break-inside:avoid;page-break-inside:avoid}
+  .key-msg{break-inside:avoid;page-break-inside:avoid}
+  .ex-row{break-inside:avoid;page-break-inside:avoid}
+  .lens-box{break-inside:avoid;page-break-inside:avoid}
+  .quote,.quote-g,.quote-l{break-inside:avoid;page-break-inside:avoid}
+  p{break-inside:avoid;page-break-inside:avoid;orphans:3;widows:3}
+  .h3,.h4{break-after:avoid;page-break-after:avoid}
+  .sec-title,.topbar{break-after:avoid;page-break-after:avoid}
+  @page{size:A4;margin:0}
+}
+</style>
+</head>
+<body>
+
+<div class="print-bar">
+  <div>
+    <div class="pb-title">{{P1_NAME}} &amp; {{P2_NAME}}</div>
+    <div class="pb-sub">{{REPORT_KIND}} · {{SCORE}}%</div>
+  </div>
+  <button class="print-btn" onclick="window.print()">Salva in PDF</button>
+</div>
+
+<div class="pages">
+
+<!-- ══════════════ 1 — COPERTINA ══════════════ -->
+<div class="page">
+  <div class="page-bg"></div>
+  <div class="blob" style="width:520px;height:520px;background:radial-gradient(circle,rgba(111,77,255,0.16) 0%,transparent 70%);top:-140px;left:-120px"></div>
+  <div class="blob" style="width:380px;height:380px;background:radial-gradient(circle,rgba(255,141,232,0.10) 0%,transparent 70%);bottom:-90px;right:-70px"></div>
+  <div class="blob" style="width:240px;height:240px;background:radial-gradient(circle,rgba(232,201,106,0.07) 0%,transparent 70%);top:42%;right:14%"></div>
+
+  <div class="pg" style="padding:56px 58px">
+    <div class="topbar">
+      <div class="logo-w"><span class="logo-glyph">&#10022;</span><span class="logo-t">LIGNAGGIO</span></div>
+      <div class="tag tag-a">{{REPORT_KIND}}</div>
+    </div>
+
+    <div class="cap" style="letter-spacing:2.5px;text-transform:uppercase;font-weight:700;margin-bottom:10px">Lettura personale</div>
+    <div class="h2" style="margin-bottom:6px">Quello che vi lega<br><span class="gt">e come si muove</span></div>
+
+    <div style="margin-top:36px;display:flex;align-items:center;gap:34px">
+      <div class="ring-wrap">
+        <svg width="230" height="230" viewBox="0 0 230 230">
+          <defs>
+            <linearGradient id="ringgrad" x1="0%" y1="0%" x2="100%" y2="100%">
+              <stop offset="0%" stop-color="#6F4DFF"/>
+              <stop offset="100%" stop-color="#FF8DE8"/>
+            </linearGradient>
+          </defs>
+          <circle cx="115" cy="115" r="100" fill="none" stroke="rgba(180,106,255,0.14)" stroke-width="12"/>
+          <circle cx="115" cy="115" r="100" fill="none" stroke="url(#ringgrad)" stroke-width="12"
+                  stroke-linecap="round" stroke-dasharray="628"
+                  stroke-dashoffset="{{SCORE_OFFSET}}" transform="rotate(-90 115 115)"/>
+        </svg>
+        <div class="ring-val">
+          <div class="ring-num">{{SCORE}}%</div>
+          <div class="ring-cap">{{SCORE_CAPTION}}</div>
+        </div>
+      </div>
+
+      <div style="flex:1">
+        <div class="card">
+          {{COVER_BARS}}
+        </div>
+      </div>
+    </div>
+
+    <div style="margin-top:34px" class="pair">
+      <div class="pair-side">
+        <div class="pair-name">{{P1_NAME}}</div>
+        <div class="pair-num">{{P1_ARCH_NUM}}</div>
+        <div class="pair-arch">{{P1_ARCH_NAME}}</div>
+        <div class="pair-birth">{{P1_BIRTH}}</div>
+      </div>
+      <div class="pair-amp">&amp;</div>
+      <div class="pair-side">
+        <div class="pair-name">{{P2_NAME}}</div>
+        <div class="pair-num">{{P2_ARCH_NUM}}</div>
+        <div class="pair-arch">{{P2_ARCH_NAME}}</div>
+        <div class="pair-birth">{{P2_BIRTH}}</div>
+      </div>
+    </div>
+
+    {{UNION_CARD}}
+
+    <div class="pf">
+      <div class="cap">Lignaggio · {{REPORT_KIND}}</div>
+      <div class="cap">1</div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════ 2..N — SEZIONI ══════════════ -->
+{{SECTION_PAGES}}
+
+<!-- ══════════════ ESERCIZI ══════════════ -->
+{{EXERCISES_PAGE}}
+
+<!-- ══════════════ REGALO ══════════════ -->
+{{GIFT_PAGE}}
+
+</div>
+</body>
+</html>

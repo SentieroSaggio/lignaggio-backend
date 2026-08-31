@@ -37,6 +37,66 @@
     print-color-adjust: exact;
   }
 
+  /* ── Exercise box: the action a section ends on ── */
+  .km-box {
+    margin: 4mm 0 0;
+    padding: 4mm 5mm;
+    border: 1px solid rgba(232,201,106,0.42);
+    border-radius: 3mm;
+    background: linear-gradient(155deg, rgba(232,201,106,0.10), rgba(232,201,106,0.02));
+    break-inside: avoid;
+  }
+  .km-box-head {
+    display: flex; align-items: baseline; justify-content: space-between; gap: 4mm;
+    margin-bottom: 2mm;
+  }
+  .km-box-label {
+    font-family: 'Inter', sans-serif; font-size: 6.5pt; font-weight: 700;
+    letter-spacing: 0.22em; text-transform: uppercase; color: var(--gold);
+  }
+  .km-box-time {
+    font-family: 'Inter', sans-serif; font-size: 6.5pt; font-weight: 600;
+    color: rgba(232,201,106,0.85); white-space: nowrap;
+  }
+  .km-box-title {
+    font-family: 'Cormorant Garamond', serif; font-size: 11.5pt; font-weight: 700;
+    color: var(--text-primary); margin-bottom: 1.5mm;
+  }
+  .km-box-text {
+    font-family: 'Inter', sans-serif; font-size: 8.5pt; font-weight: 300;
+    line-height: 1.65; color: var(--text-muted);
+  }
+
+  /* ── Donut legend ── */
+  .donut-legend {
+    display: flex; flex-wrap: wrap; justify-content: center; gap: 2mm 4mm; margin-top: 3mm;
+  }
+  .donut-legend-item {
+    display: inline-flex; align-items: center; gap: 1.5mm;
+    font-family: 'Inter', sans-serif; font-size: 7pt; color: var(--text-muted);
+  }
+  .donut-legend-dot { width: 2.4mm; height: 2.4mm; border-radius: 50%; display: inline-block; }
+
+  /* ── Gift page ── */
+  .gift-page-box {
+    margin-top: 8mm; padding: 8mm 9mm; border-radius: 4mm;
+    border: 1px solid rgba(232,201,106,0.45);
+    background: linear-gradient(160deg, rgba(232,201,106,0.12), rgba(232,201,106,0.02));
+    text-align: center;
+  }
+  .gift-page-lenses {
+    display: flex; flex-wrap: wrap; justify-content: center; gap: 2mm; margin: 5mm 0;
+  }
+  .gift-page-lens {
+    font-family: 'Inter', sans-serif; font-size: 8pt; font-weight: 600;
+    color: rgba(232,201,106,0.90); padding: 1.5mm 4mm; border-radius: 20mm;
+    border: 1px solid rgba(232,201,106,0.35); background: rgba(232,201,106,0.06);
+  }
+  .gift-page-link {
+    font-family: 'Inter', sans-serif; font-size: 9.5pt; font-weight: 600;
+    color: var(--gold-light); word-break: break-all;
+  }
+
   /* ── Page breaks ── */
   .page {
     width: 210mm;
@@ -599,107 +659,9 @@
   <div class="section-eyebrow">02 — Grafico di Compatibilità</div>
   <h2 class="section-title">COMPATIBILITY<br><span>CHART</span></h2>
 
-  <div class="chart-grid">
-    <!-- Sector bars -->
-    <div class="chart-panel">
-      <div class="chart-panel-title">Settori di Compatibilità</div>
-      <div class="sector-bars">
-        <div class="sector-row">
-          <div class="sector-label">Connessione emotiva</div>
-          <div class="sector-bar-track"><div class="sector-bar-fill" style="width:{{EM_PCT}}%"></div></div>
-          <div class="sector-pct">{{EM_PCT}}%</div>
-        </div>
-        <div class="sector-row">
-          <div class="sector-label">Comunicazione</div>
-          <div class="sector-bar-track"><div class="sector-bar-fill" style="width:{{COM_PCT}}%"></div></div>
-          <div class="sector-pct">{{COM_PCT}}%</div>
-        </div>
-        <div class="sector-row">
-          <div class="sector-label">Valori condivisi</div>
-          <div class="sector-bar-track"><div class="sector-bar-fill" style="width:{{VAL_PCT}}%"></div></div>
-          <div class="sector-pct">{{VAL_PCT}}%</div>
-        </div>
-        <div class="sector-row">
-          <div class="sector-label">Potenziale futuro</div>
-          <div class="sector-bar-track"><div class="sector-bar-fill" style="width:{{POT_PCT}}%"></div></div>
-          <div class="sector-pct">{{POT_PCT}}%</div>
-        </div>
-        <div class="sector-row">
-          <div class="sector-label">Intimità</div>
-          <div class="sector-bar-track"><div class="sector-bar-fill" style="width:{{INT_PCT}}%"></div></div>
-          <div class="sector-pct">{{INT_PCT}}%</div>
-        </div>
-      </div>
-    </div>
+  {{CHART_GRID}}
 
-    <!-- Circular SVG chart -->
-    <div class="chart-panel">
-      <div class="chart-panel-title">Distribuzione Energetica</div>
-      <svg viewBox="0 0 160 160" style="width:100%;max-width:55mm;display:block;margin:0 auto">
-        <defs>
-          <linearGradient id="cg1" x1="0%" y1="0%" x2="100%" y2="100%">
-            <stop offset="0%" stop-color="#6f4dff"/>
-            <stop offset="100%" stop-color="#ff6dae"/>
-          </linearGradient>
-          <linearGradient id="cg2" x1="0%" y1="0%" x2="100%" y2="100%">
-            <stop offset="0%" stop-color="#e8c96a"/>
-            <stop offset="100%" stop-color="#b46aff"/>
-          </linearGradient>
-        </defs>
-        <!-- Outer ring -->
-        <circle cx="80" cy="80" r="68" fill="none" stroke="rgba(111,77,255,0.08)" stroke-width="24"/>
-        <!-- Segments -->
-        <circle cx="80" cy="80" r="68" fill="none" stroke="url(#cg1)" stroke-width="24"
-          stroke-dasharray="{{CHART_SEG1}} {{CHART_REST1}}" stroke-dashoffset="{{CHART_OFF1}}"
-          transform="rotate(-90 80 80)" stroke-linecap="butt"/>
-        <circle cx="80" cy="80" r="68" fill="none" stroke="url(#cg2)" stroke-width="24"
-          stroke-dasharray="{{CHART_SEG2}} {{CHART_REST2}}" stroke-dashoffset="{{CHART_OFF2}}"
-          transform="rotate(-90 80 80)" stroke-linecap="butt"/>
-        <circle cx="80" cy="80" r="68" fill="none" stroke="rgba(255,109,174,0.35)" stroke-width="24"
-          stroke-dasharray="{{CHART_SEG3}} {{CHART_REST3}}" stroke-dashoffset="{{CHART_OFF3}}"
-          transform="rotate(-90 80 80)" stroke-linecap="butt"/>
-        <!-- Inner circle -->
-        <circle cx="80" cy="80" r="52" fill="rgba(26,10,46,0.85)"/>
-        <text x="80" y="73" text-anchor="middle" font-family="Cormorant Garamond,serif" font-size="22" font-weight="700" fill="white">{{SCORE}}</text>
-        <text x="80" y="91" text-anchor="middle" font-family="Inter,sans-serif" font-size="9" fill="rgba(200,170,255,0.75)">su 100</text>
-      </svg>
-    </div>
-  </div>
-
-  <!-- Trading-style indicators -->
-  <div style="margin-top:5mm">
-    <div class="chart-panel-title" style="margin-bottom:3mm;font-size:7pt;font-weight:600;letter-spacing:0.2em;color:var(--purple-light);text-transform:uppercase">Indicatori di Tendenza</div>
-    <div class="trading-grid">
-      <div class="trading-box">
-        <div class="trading-box-label">Trend Relazione</div>
-        <div style="display:flex;align-items:center;gap:2mm">
-          <div class="trading-box-val">{{TREND_LABEL}}</div>
-          <div class="trading-box-arrow {{TREND_ARROW_CLASS}}">{{TREND_ARROW}}</div>
-        </div>
-      </div>
-      <div class="trading-box">
-        <div class="trading-box-label">Crescita Compatibilità</div>
-        <div style="display:flex;align-items:center;gap:2mm">
-          <div class="trading-box-val">{{GROWTH_LABEL}}</div>
-          <div class="trading-box-arrow {{GROWTH_ARROW_CLASS}}">{{GROWTH_ARROW}}</div>
-        </div>
-      </div>
-      <div class="trading-box">
-        <div class="trading-box-label">Forza Emotiva</div>
-        <div style="display:flex;align-items:center;gap:2mm">
-          <div class="trading-box-val">{{EM_PCT}}%</div>
-          <div class="trading-box-arrow arrow-up">▲</div>
-        </div>
-      </div>
-      <div class="trading-box">
-        <div class="trading-box-label">Allineamento Valori</div>
-        <div style="display:flex;align-items:center;gap:2mm">
-          <div class="trading-box-val">{{VAL_PCT}}%</div>
-          <div class="trading-box-arrow {{VAL_ARROW_CLASS}}">{{VAL_ARROW}}</div>
-        </div>
-      </div>
-    </div>
-  </div>
+  {{TRADING_SECTION}}
 </div>
 
 <!-- ══════════════════════════════════════════════════════════
@@ -755,7 +717,7 @@
     <div class="consult-block-head">
       <div class="consult-block-num">05</div>
       <div class="consult-block-title">Connessione Anima</div>
-      <div class="consult-block-pct">{{EM_PCT}}%</div>
+      {{PCT_ANIMA}}
     </div>
     <div class="consult-block-body">{{ANIMA_HTML}}</div>
   </div>
@@ -764,6 +726,7 @@
     <div class="consult-block-head">
       <div class="consult-block-num">06</div>
       <div class="consult-block-title">Dinamica Karma</div>
+      {{PCT_KARMA}}
     </div>
     <div class="consult-block-body">{{KARMA_HTML}}</div>
   </div>
@@ -772,7 +735,7 @@
     <div class="consult-block-head">
       <div class="consult-block-num">07</div>
       <div class="consult-block-title">Intimità e Risonanza Emotiva</div>
-      <div class="consult-block-pct">{{INT_PCT}}%</div>
+      {{PCT_INTIMITA}}
     </div>
     <div class="consult-block-body">{{INTIMITA_HTML}}</div>
   </div>
@@ -794,7 +757,7 @@
     <div class="consult-block-head">
       <div class="consult-block-num">08</div>
       <div class="consult-block-title">Finanze e Costruzione Materiale</div>
-      <div class="consult-block-pct">{{VAL_PCT}}%</div>
+      {{PCT_FINANZE}}
     </div>
     <div class="consult-block-body">{{FINANZE_HTML}}</div>
   </div>
@@ -803,7 +766,7 @@
     <div class="consult-block-head">
       <div class="consult-block-num">09</div>
       <div class="consult-block-title">Potenziale Evolutivo della Relazione</div>
-      <div class="consult-block-pct">{{POT_PCT}}%</div>
+      {{PCT_POTENZIALE}}
     </div>
     <div class="consult-block-body">{{POTENTIALE_HTML}}</div>
   </div>
@@ -821,6 +784,10 @@
     © Lettura basata su Matrice di Compatibilità, Numerologia e Astrologia · lignaggio.it
   </div>
 </div>
+
+{{EXERCISES_PAGE}}
+
+{{GIFT_PAGE}}
 
 </body>
 </html>

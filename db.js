@@ -76,12 +76,22 @@ try { db.exec('ALTER TABLE sessions ADD COLUMN bonus_code TEXT'); } catch (_) {}
 try { db.exec('ALTER TABLE sessions ADD COLUMN quiz_context_json TEXT'); } catch (_) {}
 // Keitaro click id captured from ?subid= on the landing page.
 try { db.exec('ALTER TABLE sessions ADD COLUMN keitaro_subid TEXT'); } catch (_) {}
-// Our own campaign label captured from ?src= on the landing page - which
-// reel, story or post this quiz came from. Independent of the click id above.
+// Our own campaign label captured from ?src= on the landing page — which reel,
+// story or post this quiz came from. Independent of the Keitaro click id above.
 try { db.exec('ALTER TABLE sessions ADD COLUMN traffic_src TEXT'); } catch (_) {}
 // How many times the reconciler has tried to generate this consultation, so a
 // permanently failing order cannot retry forever and burn OpenAI credit.
 try { db.exec('ALTER TABLE sessions ADD COLUMN consultation_attempts INTEGER DEFAULT 0'); } catch (_) {}
+// Analisi Focus — the gift a buyer claims after paying: one of four lenses
+// (sessuale / finanze / karmico / anima) generated as a second, deeper reading.
+// bonus_status walks 'idle' → 'generating' → 'ready' (or back to 'idle' on failure).
+try { db.exec('ALTER TABLE sessions ADD COLUMN bonus_focus TEXT'); } catch (_) {}
+try { db.exec('ALTER TABLE sessions ADD COLUMN bonus_json TEXT'); } catch (_) {}
+try { db.exec('ALTER TABLE sessions ADD COLUMN bonus_status TEXT'); } catch (_) {}
+try { db.exec('ALTER TABLE sessions ADD COLUMN bonus_generated_at INTEGER'); } catch (_) {}
+// Which two people this order is about: 'coppia' (default) or 'famiglia'
+// (a parent and a child). The calculation is the same; the reading is not.
+try { db.exec("ALTER TABLE sessions ADD COLUMN mode TEXT DEFAULT 'coppia'"); } catch (_) {}
 
 /**
  * One row per Stripe payment for which a Keitaro sale postback was attempted.
@@ -120,10 +130,10 @@ db.exec(`
   -- The same page opens, but only the ones that arrived with our own ?src=
   -- label, split by that label.
   --
-  -- A separate table rather than a column on visit_counts: that table's
-  -- primary key is (day, page) and widening it would mean rebuilding it and
-  -- rewriting every historical row. Here labelled traffic is counted a
-  -- second time, on its own, and visit_counts stays exactly as it was.
+  -- A separate table rather than a column on visit_counts: that table's primary
+  -- key is (day, page) and widening it would mean rebuilding it and rewriting
+  -- every historical row. Here labelled traffic is counted a second time, on
+  -- its own, and the totals in visit_counts stay exactly as they were.
   --
   -- Same privacy position as visit_counts: counters and a label we chose
   -- ourselves, no IP, no user agent, no cookie, nobody to identify.
@@ -133,6 +143,64 @@ db.exec(`
     source TEXT    NOT NULL,
     count  INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (day, page, source)
+  );
+
+  -- Rituale dei 7 giorni: one exercise a day, drawn from the consultation the
+  -- buyer already paid for. No new model calls — the exercises were written
+  -- together with the reading.
+  --
+  -- next_day is the exercise to send next (1-7). A row leaves the queue when
+  -- next_day passes 7 or the reader unsubscribes.
+  -- Analisi Focus acquistate oltre al regalo.
+  --
+  -- The gift lives on the sessions row because there is exactly one per order.
+  -- Extra lenses are a different shape — many per order, each with its own
+  -- payment — so they get their own table rather than four more columns.
+  CREATE TABLE IF NOT EXISTS bonus_extra (
+    calculation_id    TEXT NOT NULL,
+    focus             TEXT NOT NULL,
+    status            TEXT NOT NULL DEFAULT 'pending',
+    bonus_json        TEXT,
+    checkout_session  TEXT,
+    paid_at           INTEGER,
+    created_at        INTEGER,
+    PRIMARY KEY (calculation_id, focus)
+  );
+
+  -- Il tuo Spazio: accesso via link inviato per email.
+  --
+  -- Two kinds of token live here. A 'magic' one is short-lived and single use —
+  -- it is what travels through an inbox. Exchanging it produces an 'access'
+  -- token the browser keeps, so the link in the email stops working the moment
+  -- it has been used.
+  --
+  -- No passwords, no accounts: the email address is the identity, exactly as it
+  -- already is for the receipt and the consultation.
+  CREATE TABLE IF NOT EXISTS space_tokens (
+    token       TEXT PRIMARY KEY,
+    email       TEXT NOT NULL,
+    kind        TEXT NOT NULL,
+    created_at  INTEGER NOT NULL,
+    expires_at  INTEGER NOT NULL,
+    used_at     INTEGER
+  );
+
+  -- Chi vuole la Carta Natale quando ci sarà.
+  CREATE TABLE IF NOT EXISTS natal_waitlist (
+    email       TEXT PRIMARY KEY,
+    birth_date  TEXT,
+    birth_time  TEXT,
+    birth_place TEXT,
+    created_at  INTEGER
+  );
+
+  CREATE TABLE IF NOT EXISTS ritual_progress (
+    calculation_id TEXT PRIMARY KEY,
+    email          TEXT NOT NULL,
+    next_day       INTEGER NOT NULL DEFAULT 1,
+    next_send_at   INTEGER NOT NULL,
+    unsubscribed   INTEGER NOT NULL DEFAULT 0,
+    created_at     INTEGER
   );
 `);
 // Normalize timestamps stored as Unix seconds → milliseconds
@@ -176,6 +244,14 @@ const stmtUpdatePreview = db.prepare(`
   UPDATE sessions SET preview_json = @preview_json WHERE id = @id
 `);
 
+// Only ever moves a row away from the default, never back: whichever request
+// arrives with a real mode is the one that knows which funnel this order came
+// from.
+const stmtUpdateMode = db.prepare(`
+  UPDATE sessions SET mode = @mode
+   WHERE id = @id AND (mode IS NULL OR mode = 'coppia')
+`);
+
 const stmtMarkPaid = db.prepare(`
   UPDATE sessions SET payment_status = 'paid', access_token = @access_token,
     selected_price = COALESCE(@selected_price, selected_price) WHERE id = @id
@@ -205,6 +281,139 @@ const stmtGetSessionEmail = db.prepare(`
   SELECT * FROM session_emails WHERE calculation_id = ?
 `);
 
+// ── Il tuo Spazio statements ─────────────────────────────────────────────────
+const stmtInsertSpaceToken = db.prepare(`
+  INSERT INTO space_tokens (token, email, kind, created_at, expires_at)
+  VALUES (@token, @email, @kind, @created_at, @expires_at)
+`);
+
+const stmtGetSpaceToken = db.prepare(`
+  SELECT * FROM space_tokens WHERE token = ? AND kind = ?
+`);
+
+const stmtUseSpaceToken = db.prepare(`
+  UPDATE space_tokens SET used_at = @used_at
+   WHERE token = @token AND kind = 'magic' AND used_at IS NULL
+`);
+
+const stmtPurgeSpaceTokens = db.prepare(`
+  DELETE FROM space_tokens WHERE expires_at < @now
+`);
+
+// One row per order that carries this email, newest first. The consultation
+// join tells the page whether there is anything to reopen.
+const stmtSpaceSessions = db.prepare(`
+  SELECT
+    s.id, s.partner1_name, s.partner2_name, s.partner1_birth, s.partner2_birth,
+    s.compatibility_json, s.payment_status, s.created_at,
+    s.bonus_focus, s.bonus_status,
+    (SELECT COUNT(*) FROM consultations c WHERE c.calculation_id = s.id) AS has_consultation
+  FROM sessions s
+  JOIN session_emails e ON e.calculation_id = s.id
+ WHERE e.email = @email
+ ORDER BY s.created_at DESC
+ LIMIT 50
+`);
+
+const stmtAddWaitlist = db.prepare(`
+  INSERT INTO natal_waitlist (email, birth_date, birth_time, birth_place, created_at)
+  VALUES (@email, @birth_date, @birth_time, @birth_place, @created_at)
+  ON CONFLICT(email) DO UPDATE SET
+    birth_date  = COALESCE(excluded.birth_date,  natal_waitlist.birth_date),
+    birth_time  = COALESCE(excluded.birth_time,  natal_waitlist.birth_time),
+    birth_place = COALESCE(excluded.birth_place, natal_waitlist.birth_place)
+`);
+
+const stmtGetWaitlist = db.prepare(`
+  SELECT * FROM natal_waitlist WHERE email = ?
+`);
+
+// ── Analisi Focus acquistate statements ──────────────────────────────────────
+const stmtStartExtra = db.prepare(`
+  INSERT INTO bonus_extra (calculation_id, focus, status, checkout_session, created_at)
+  VALUES (@calculation_id, @focus, 'pending', @checkout_session, @created_at)
+  ON CONFLICT(calculation_id, focus) DO UPDATE SET
+    checkout_session = excluded.checkout_session
+  WHERE bonus_extra.status = 'pending'
+`);
+
+const stmtMarkExtraPaid = db.prepare(`
+  UPDATE bonus_extra SET status = 'generating', paid_at = @paid_at
+   WHERE calculation_id = @calculation_id AND focus = @focus AND status = 'pending'
+`);
+
+const stmtSaveExtra = db.prepare(`
+  UPDATE bonus_extra SET status = 'ready', bonus_json = @bonus_json
+   WHERE calculation_id = @calculation_id AND focus = @focus
+`);
+
+const stmtGetExtra = db.prepare(`
+  SELECT * FROM bonus_extra WHERE calculation_id = ? AND focus = ?
+`);
+
+const stmtListExtra = db.prepare(`
+  SELECT focus, status, bonus_json FROM bonus_extra
+   WHERE calculation_id = ? AND status != 'pending'
+   ORDER BY paid_at ASC
+`);
+
+// ── Rituale dei 7 giorni statements ──────────────────────────────────────────
+const stmtEnrolRitual = db.prepare(`
+  INSERT OR IGNORE INTO ritual_progress
+    (calculation_id, email, next_day, next_send_at, unsubscribed, created_at)
+  VALUES (@calculation_id, @email, 1, @next_send_at, 0, @created_at)
+`);
+
+const stmtGetRitualDue = db.prepare(`
+  SELECT calculation_id, email, next_day
+    FROM ritual_progress
+   WHERE unsubscribed = 0
+     AND next_day <= @max_day
+     AND next_send_at <= @now
+   ORDER BY next_send_at ASC
+   LIMIT @limit
+`);
+
+const stmtAdvanceRitual = db.prepare(`
+  UPDATE ritual_progress
+     SET next_day = next_day + 1, next_send_at = @next_send_at
+   WHERE calculation_id = @calculation_id
+`);
+
+const stmtUnsubRitual = db.prepare(`
+  UPDATE ritual_progress SET unsubscribed = 1
+   WHERE calculation_id = @calculation_id AND unsubscribed = 0
+`);
+
+const stmtGetRitual = db.prepare(`
+  SELECT * FROM ritual_progress WHERE calculation_id = ?
+`);
+
+// ── Analisi Focus statements ─────────────────────────────────────────────────
+const stmtGetBonusState = db.prepare(`
+  SELECT bonus_focus, bonus_json, bonus_status, bonus_generated_at
+    FROM sessions WHERE id = ?
+`);
+
+// The WHERE guard makes the claim atomic: better-sqlite3 is synchronous, so two
+// concurrent requests cannot both see an empty bonus_focus and both write.
+const stmtClaimBonusFocus = db.prepare(`
+  UPDATE sessions
+     SET bonus_focus = @bonus_focus, bonus_status = 'generating'
+   WHERE id = @id AND (bonus_focus IS NULL OR bonus_focus = '')
+`);
+
+const stmtSaveBonus = db.prepare(`
+  UPDATE sessions
+     SET bonus_json = @bonus_json, bonus_status = 'ready',
+         bonus_generated_at = @bonus_generated_at
+   WHERE id = @id
+`);
+
+const stmtResetBonus = db.prepare(`
+  UPDATE sessions SET bonus_status = 'idle' WHERE id = @id AND bonus_json IS NULL
+`);
+
 // ── Keitaro attribution ──────────────────────────────────────────────────────
 
 /** Store the click id, but never overwrite one that is already recorded. */
@@ -217,9 +426,9 @@ const stmtGetSubid = db.prepare(`
   SELECT keitaro_subid FROM sessions WHERE id = ?
 `);
 
-// -- Our own campaign label --------------------------------------------------
-// Same first-wins rule as the click id: a visitor who wanders back in through
-// a second link mid-funnel must not rewrite the source of a started quiz.
+// ── Our own campaign label ───────────────────────────────────────────────────
+// Same first-wins rule as the click id: a visitor who wanders back in through a
+// second link mid-funnel must not rewrite the source of a quiz already started.
 
 const stmtSaveTrafficSrc = db.prepare(`
   UPDATE sessions SET traffic_src = @src
@@ -311,10 +520,15 @@ const stmtGetAbandonedCandidates = db.prepare(`
  * @param {object} partner2 - { name, gender, birthDate }
  * @param {object} compatibility - full compatibility object
  */
-function insertSession(id, partner1, partner2, compatibility, quizContext) {
+function insertSession(id, partner1, partner2, compatibility, quizContext, mode) {
   const quizJson = (Array.isArray(quizContext) && quizContext.length)
     ? JSON.stringify(quizContext)
     : null;
+
+  // Written separately from the INSERT: the row may already exist (the webhook
+  // can beat the preview request), and the mode must survive that race the same
+  // way the quiz answers do.
+  const cleanMode = (mode === 'famiglia') ? 'famiglia' : 'coppia';
 
   stmtInsertSession.run({
     id,
@@ -336,6 +550,7 @@ function insertSession(id, partner1, partner2, compatibility, quizContext) {
   if (quizJson) {
     stmtUpdateQuizContext.run({ id, quiz_context_json: quizJson });
   }
+  stmtUpdateMode.run({ id, mode: cleanMode });
 }
 
 /**
@@ -546,6 +761,257 @@ function getBonusCode(calculationId) {
   return (row && row.bonus_code) || null;
 }
 
+// ── Il tuo Spazio ────────────────────────────────────────────────────────────
+
+/**
+ * Store a token. Expired rows are swept on the way in, so the table cannot grow
+ * without limit and nothing needs a cron job.
+ *
+ * @param {string} token
+ * @param {string} email
+ * @param {'magic'|'access'} kind
+ * @param {number} ttlMs
+ */
+function saveSpaceToken(token, email, kind, ttlMs) {
+  const now = Date.now();
+  stmtPurgeSpaceTokens.run({ now });
+  stmtInsertSpaceToken.run({
+    token, email, kind, created_at: now, expires_at: now + ttlMs,
+  });
+}
+
+/**
+ * The email behind a token, or null when it is unknown, expired, or — for a
+ * magic link — already used.
+ *
+ * @param {string} token
+ * @param {'magic'|'access'} kind
+ * @returns {string|null}
+ */
+function readSpaceToken(token, kind) {
+  const row = stmtGetSpaceToken.get(token, kind);
+  if (!row) { return null; }
+  if (row.expires_at < Date.now()) { return null; }
+  if (kind === 'magic' && row.used_at) { return null; }
+  return row.email;
+}
+
+/**
+ * Burn a magic link. The WHERE guard is what makes it single use: two clicks on
+ * the same link race, and only the first one changes a row.
+ *
+ * @param {string} token
+ * @returns {boolean} true when this call consumed the link
+ */
+function consumeSpaceToken(token) {
+  return stmtUseSpaceToken.run({ token, used_at: Date.now() }).changes > 0;
+}
+
+/**
+ * Every calculation belonging to an address.
+ * @param {string} email
+ * @returns {Array<object>}
+ */
+function getSpaceSessions(email) {
+  return stmtSpaceSessions.all({ email });
+}
+
+/**
+ * @param {{email: string, birthDate?: string, birthTime?: string, birthPlace?: string}} entry
+ */
+function addToNatalWaitlist(entry) {
+  stmtAddWaitlist.run({
+    email:       entry.email,
+    birth_date:  entry.birthDate  || null,
+    birth_time:  entry.birthTime  || null,
+    birth_place: entry.birthPlace || null,
+    created_at:  Date.now(),
+  });
+}
+
+/** @returns {object|null} */
+function getNatalWaitlistEntry(email) {
+  return stmtGetWaitlist.get(email) || null;
+}
+
+// ── Analisi Focus acquistate ─────────────────────────────────────────────────
+
+/**
+ * Record an intent to buy one more lens. Re-running it for a lens still waiting
+ * to be paid just updates the checkout session, so an abandoned checkout can be
+ * retried without leaving orphan rows.
+ *
+ * @param {string} calculationId
+ * @param {string} focus
+ * @param {string} checkoutSessionId
+ * @returns {boolean} false when that lens is already paid for
+ */
+function startExtraPurchase(calculationId, focus, checkoutSessionId) {
+  const existing = stmtGetExtra.get(calculationId, focus);
+  if (existing && existing.status !== 'pending') { return false; }
+  stmtStartExtra.run({
+    calculation_id:   calculationId,
+    focus,
+    checkout_session: checkoutSessionId,
+    created_at:       Date.now(),
+  });
+  return true;
+}
+
+/**
+ * Move a lens from pending to generating once Stripe confirms the payment.
+ * The status guard makes webhook retries harmless.
+ *
+ * @returns {boolean} true when this call is the one that claimed the payment
+ */
+function markExtraPaid(calculationId, focus) {
+  return stmtMarkExtraPaid.run({
+    calculation_id: calculationId, focus, paid_at: Date.now(),
+  }).changes > 0;
+}
+
+/** @param {object} bonusObj */
+function saveExtraBonus(calculationId, focus, bonusObj) {
+  stmtSaveExtra.run({
+    calculation_id: calculationId, focus, bonus_json: JSON.stringify(bonusObj),
+  });
+}
+
+/**
+ * Every paid extra lens for an order, ready or still being written.
+ * @returns {Array<{focus: string, status: string, bonus: object|null}>}
+ */
+function listExtraBonuses(calculationId) {
+  return stmtListExtra.all(calculationId).map(function (row) {
+    let bonus = null;
+    if (row.bonus_json) {
+      try { bonus = JSON.parse(row.bonus_json); } catch (_) { bonus = null; }
+    }
+    return { focus: row.focus, status: row.status, bonus };
+  });
+}
+
+/** @returns {object|null} */
+function getExtraBonus(calculationId, focus) {
+  return stmtGetExtra.get(calculationId, focus) || null;
+}
+
+// ── Rituale dei 7 giorni ─────────────────────────────────────────────────────
+
+const RITUAL_TOTAL_DAYS = 7;
+
+/**
+ * Put a buyer in the seven-day queue. Idempotent: re-running generation for the
+ * same order must not restart the sequence from day one.
+ *
+ * @param {string} calculationId
+ * @param {string} email
+ * @param {number} firstSendAt  epoch ms of the first exercise
+ * @returns {boolean} true when a new row was created
+ */
+function enrolInRitual(calculationId, email, firstSendAt) {
+  const info = stmtEnrolRitual.run({
+    calculation_id: calculationId,
+    email,
+    next_send_at:   firstSendAt,
+    created_at:     Date.now(),
+  });
+  return info.changes > 0;
+}
+
+/**
+ * Rows whose next exercise is due.
+ * @param {number} [limit]
+ * @returns {Array<{calculation_id: string, email: string, next_day: number}>}
+ */
+function getRitualDue(limit) {
+  return stmtGetRitualDue.all({ now: Date.now(), max_day: RITUAL_TOTAL_DAYS, limit: limit || 25 });
+}
+
+/**
+ * Move a reader to the next day, or drop them from the queue after the last one.
+ * @param {string} calculationId
+ * @param {number} nextSendAt  epoch ms for the following exercise
+ */
+function advanceRitual(calculationId, nextSendAt) {
+  stmtAdvanceRitual.run({ calculation_id: calculationId, next_send_at: nextSendAt });
+}
+
+/**
+ * @param {string} calculationId
+ * @returns {boolean} true when a row was actually stopped
+ */
+function unsubscribeFromRitual(calculationId) {
+  return stmtUnsubRitual.run({ calculation_id: calculationId }).changes > 0;
+}
+
+/** @returns {object|null} */
+function getRitualProgress(calculationId) {
+  return stmtGetRitual.get(calculationId) || null;
+}
+
+// ── Analisi Focus (the post-purchase gift) ───────────────────────────────────
+
+/**
+ * Claim a lens for a session. Idempotent by design: the first claim wins and
+ * later calls are ignored, so a double-tap on the choice screen cannot start a
+ * second generation or silently swap the gift the buyer already received.
+ *
+ * @param {string} calculationId
+ * @param {string} focus  one of sessuale | finanze | karmico | anima
+ * @returns {{claimed: boolean, focus: string|null, status: string}}
+ */
+function claimBonusFocus(calculationId, focus) {
+  const row = stmtGetBonusState.get(calculationId);
+  if (!row) { return { claimed: false, focus: null, status: 'missing' }; }
+  if (row.bonus_focus) {
+    return { claimed: false, focus: row.bonus_focus, status: row.bonus_status || 'idle' };
+  }
+  stmtClaimBonusFocus.run({ id: calculationId, bonus_focus: focus });
+  return { claimed: true, focus, status: 'generating' };
+}
+
+/**
+ * Store the generated gift and mark it ready.
+ * @param {string} calculationId
+ * @param {object} bonusObj  { titolo, sezioni: [...], esercizi: [...] }
+ */
+function saveBonusAnalysis(calculationId, bonusObj) {
+  stmtSaveBonus.run({
+    id:                 calculationId,
+    bonus_json:         JSON.stringify(bonusObj),
+    bonus_generated_at: Date.now(),
+  });
+}
+
+/**
+ * Release a failed generation so the buyer can try again with the same lens.
+ * @param {string} calculationId
+ */
+function resetBonusStatus(calculationId) {
+  stmtResetBonus.run({ id: calculationId });
+}
+
+/**
+ * Current gift state for a session.
+ * @param {string} calculationId
+ * @returns {{focus: string|null, status: string, bonus: object|null, generatedAt: number|null}|null}
+ */
+function getBonusAnalysis(calculationId) {
+  const row = stmtGetBonusState.get(calculationId);
+  if (!row) { return null; }
+  let bonus = null;
+  if (row.bonus_json) {
+    try { bonus = JSON.parse(row.bonus_json); } catch (_) { bonus = null; }
+  }
+  return {
+    focus:       row.bonus_focus   || null,
+    status:      row.bonus_status  || 'idle',
+    bonus,
+    generatedAt: row.bonus_generated_at || null,
+  };
+}
+
 function getAbandonedCandidates(minAgeMs) {
   const cutoff = Date.now() - minAgeMs;
   return stmtGetAbandonedCandidates.all({ cutoff });
@@ -711,18 +1177,18 @@ function getStatsAttribution(windowMs) {
 /**
  * Performance of our own labelled traffic, one row per ?src= label.
  *
- * This is the number to show a partner for a reel or a post: clicks measured
- * on arrival, sales measured at payment, both by us, neither depending on
- * cookie consent, an ad blocker, or the partner's tracker.
+ * This is the number to show a partner for a reel or a post: clicks measured on
+ * arrival, sales measured at payment, both by us, neither depending on cookie
+ * consent, an ad blocker, or the partner's tracker.
  *
  * Two populations that must not be confused, and the panel labels them apart:
- *   clicks   - arrivals on a link carrying the label (visit_sources)
- *   quizzes  - of those, the ones who finished and reached the preview
+ *   clicks   — arrivals on a link carrying the label (visit_sources)
+ *   quizzes  — of those, the ones who finished the quiz and reached the preview
  *
- * Only sessions started inside the window are counted, but clicks are
- * bucketed per UTC day, so the click window is rounded outwards to the whole
- * day the cutoff falls in - half a day of clicks silently dropped would
- * understate the conversion rate of the newest campaign, the one being judged.
+ * Only sessions started inside the window are counted, but clicks are bucketed
+ * per UTC day, so the click window is rounded outwards to the whole day the
+ * cutoff falls in — a half day of clicks silently dropped would understate the
+ * conversion rate of the newest campaign, which is the one being judged.
  *
  * @param {number} windowMs how far back to count
  * @returns {{windowMs: number, sources: Array, totals: object}}
@@ -750,9 +1216,9 @@ function getStatsSources(windowMs) {
      GROUP BY traffic_src
   `).all(cutoff);
 
-  // A label can appear on one side only - clicks with no sale yet, or a sale
-  // whose clicks fell outside the window - so both sides are merged rather
-  // than joined, and a missing side reads as zero instead of dropping the row.
+  // A label can appear on one side only — clicks with no sale yet, or a sale
+  // whose clicks fell outside the window — so both sides are merged rather than
+  // joined, and a missing side reads as zero instead of dropping the row.
   const bySource = new Map();
   const rowFor = function (name) {
     if (!bySource.has(name)) {
@@ -898,12 +1364,12 @@ const stmtRecordVisitSource = db.prepare(`
 `);
 
 /**
- * Count one page open, and - when the visit arrived with one of our own
- * labels - count it a second time against that label.
+ * Count one page open, and — when the visit arrived with one of our own labels
+ * — count it a second time against that label.
  *
- * Treats both values as untrusted: only known page names are stored,
- * everything else becomes 'altro', and a label that does not match the agreed
- * shape is dropped rather than written, so nothing arbitrary reaches a table.
+ * Treats both values as untrusted: only known page names are stored, everything
+ * else becomes 'altro', and a label that does not match the agreed shape is
+ * dropped rather than written, so nothing arbitrary can reach either table.
  *
  * @param {string} page
  * @param {string} [source] our ?src= label, absent for unlabelled traffic
@@ -1041,7 +1507,29 @@ module.exports = {
   finishPostback,
   getPostback,
   getAbandonedCandidates,  saveBonusCode,
-  getBonusCode,  getAllSessions,
+  getBonusCode,
+  claimBonusFocus,
+  saveBonusAnalysis,
+  resetBonusStatus,
+  getBonusAnalysis,
+  saveSpaceToken,
+  readSpaceToken,
+  consumeSpaceToken,
+  getSpaceSessions,
+  addToNatalWaitlist,
+  getNatalWaitlistEntry,
+  startExtraPurchase,
+  markExtraPaid,
+  saveExtraBonus,
+  listExtraBonuses,
+  getExtraBonus,
+  enrolInRitual,
+  getRitualDue,
+  advanceRitual,
+  unsubscribeFromRitual,
+  getRitualProgress,
+  RITUAL_TOTAL_DAYS,
+  getAllSessions,
   getAdminSession,
   deleteSession,
   recordVisit,
