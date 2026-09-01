@@ -22,6 +22,9 @@ const chromium   = require('@sparticuz/chromium');
 const TEMPLATE_PATH  = path.join(__dirname, '..', 'templates', 'compat-report.html');
 const REPORTS_DIR    = path.join(__dirname, '..', 'storage', 'reports');
 
+/** How long the webfonts may hold up a report before it renders without them. */
+const FONT_GRACE_MS  = 8000;
+
 // Ensure storage directory exists
 if (!fs.existsSync(REPORTS_DIR)) {
   fs.mkdirSync(REPORTS_DIR, { recursive: true });
@@ -462,7 +465,26 @@ async function generatePremiumPDF(data, calculationId) {
   try {
 
     const page = await browser.newPage();
-    await page.setContent(html, { waitUntil: 'networkidle0', timeout: 30000 });
+
+    // The template pulls its fonts from Google with an @import, and waiting for
+    // 'networkidle0' made that request a hard dependency of the whole report:
+    // on Render the chain never went quiet inside the timeout, so every single
+    // buyer got "PDF generation failed: Timed out after waiting 30000ms" and no
+    // file at all.
+    //
+    // Now the markup is enough to proceed, and the fonts get a bounded grace
+    // period of their own. If they miss it the report is still produced, with
+    // fallback faces — a report that looks slightly off beats no report.
+    await page.setContent(html, { waitUntil: 'domcontentloaded', timeout: 30000 });
+
+    try {
+      await Promise.race([
+        page.evaluate(function () { return document.fonts.ready; }),
+        new Promise(function (resolve) { setTimeout(resolve, FONT_GRACE_MS); }),
+      ]);
+    } catch (fontErr) {
+      console.warn('[pdfGenerator] Fonts not ready, rendering anyway:', fontErr.message);
+    }
 
     await page.pdf({
       path:            outPath,
