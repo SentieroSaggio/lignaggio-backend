@@ -4,7 +4,10 @@
 <meta charset="UTF-8"/>
 <title>Consulenza di Compatibilità — {{P1_NAME}} & {{P2_NAME}}</title>
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Hahmlet:wght@400;600;700;800&family=Sora:wght@300;400;600;700;800&family=Inter:ital,wght@0,300;0,400;1,300&display=swap');
+/* {{EMBEDDED_FONTS}} — the faces are inlined as base64 by pdfGenerator.
+   They used to be an @import from Google, which made the whole report
+   depend on a network round trip inside a headless browser on a small
+   instance. Now nothing is fetched while the PDF is printed. */
 
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;hyphens:none;word-break:normal;overflow-wrap:break-word}
 

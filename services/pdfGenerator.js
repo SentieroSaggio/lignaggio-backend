@@ -21,9 +21,29 @@ const chromium   = require('@sparticuz/chromium');
 // message" closing every section — repainted in this funnel's violet palette.
 const TEMPLATE_PATH  = path.join(__dirname, '..', 'templates', 'compat-report.html');
 const REPORTS_DIR    = path.join(__dirname, '..', 'storage', 'reports');
+const FONTS_PATH     = path.join(__dirname, '..', 'templates', 'fonts-embedded.css');
+
+/**
+ * The report's typefaces, base64 into the document.
+ *
+ * Read once at startup, not per report: it is ~380 KB of text and every order
+ * would otherwise re-read it off disk. Missing file is survivable — the report
+ * then prints in fallback faces instead of not printing at all.
+ */
+const EMBEDDED_FONTS = (function () {
+  try {
+    return fs.readFileSync(FONTS_PATH, 'utf8');
+  } catch (err) {
+    console.warn('[pdfGenerator] fonts-embedded.css missing — report will use fallback faces');
+    return '';
+  }
+}());
 
 /** How long the webfonts may hold up a report before it renders without them. */
 const FONT_GRACE_MS  = 8000;
+
+/** Printing the pages is the slow step; the Puppeteer default of 30s cut it off. */
+const PDF_PRINT_TIMEOUT_MS = 120000;
 
 // Ensure storage directory exists
 if (!fs.existsSync(REPORTS_DIR)) {
@@ -475,8 +495,17 @@ async function generatePremiumPDF(data, calculationId) {
     // Now the markup is enough to proceed, and the fonts get a bounded grace
     // period of their own. If they miss it the report is still produced, with
     // fallback faces — a report that looks slightly off beats no report.
-    await page.setContent(html, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    const step = function (name, t0) {
+      console.log('[pdfGenerator] %s took %dms (%s)', name, Date.now() - t0, calculationId);
+    };
 
+    let t = Date.now();
+    await page.setContent(html, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    step('setContent', t);
+
+    // The faces are inlined, so this resolves off the local document. The race
+    // stays as a guard: a report in fallback faces beats a failed order.
+    t = Date.now();
     try {
       await Promise.race([
         page.evaluate(function () { return document.fonts.ready; }),
@@ -485,13 +514,19 @@ async function generatePremiumPDF(data, calculationId) {
     } catch (fontErr) {
       console.warn('[pdfGenerator] Fonts not ready, rendering anyway:', fontErr.message);
     }
+    step('fonts', t);
 
+    // Printing twenty-odd A4 pages of gradients on a small instance is the
+    // slowest step by far, and the default 30s cap was cutting it off.
+    t = Date.now();
     await page.pdf({
       path:            outPath,
       format:          'A4',
       printBackground: true,
+      timeout:         PDF_PRINT_TIMEOUT_MS,
       margin: { top: '0', right: '0', bottom: '0', left: '0' },
     });
+    step('print', t);
 
     console.log('[pdfGenerator] PDF saved:', outPath);
     return outPath;
@@ -520,6 +555,7 @@ function buildReportHtml(data, calculationId) {
 
   // Read template
   let html = fs.readFileSync(TEMPLATE_PATH, 'utf8');
+  html = html.replace('/* {{EMBEDDED_FONTS}}', EMBEDDED_FONTS + '\n/*');
 
   const mode  = data.mode === 'famiglia' ? 'famiglia' : 'coppia';
   const kind  = REPORT_KIND[mode];
