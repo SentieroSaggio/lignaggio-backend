@@ -13,6 +13,7 @@ const path       = require('path');
 const fs         = require('fs');
 const puppeteer  = require('puppeteer-core');
 const chromium   = require('@sparticuz/chromium');
+const reportBlocks = require('./reportBlocks');
 
 // Paths
 //
@@ -38,6 +39,27 @@ const EMBEDDED_FONTS = (function () {
     return '';
   }
 }());
+
+/**
+ * The file a given order's report lives in.
+ *
+ * The chapter set is part of the name. Without it, someone who bought one
+ * chapter and later bought the rest would be handed the one-chapter file back:
+ * it already existed under that calculation id, so the generator would skip
+ * the rebuild and never notice the order had grown.
+ *
+ * A whole order keeps the plain name, so nothing already on disk is orphaned.
+ *
+ * @param {string} calculationId
+ * @param {string[]|null|undefined} blocks
+ * @returns {string}
+ */
+function reportFileName(calculationId, blocks) {
+  if (!Array.isArray(blocks) || blocks.length === 0 || blocks.indexOf('*') !== -1) {
+    return 'report_' + calculationId + '.pdf';
+  }
+  return 'report_' + calculationId + '_' + blocks.slice().sort().join('-') + '.pdf';
+}
 
 /** How long the webfonts may hold up a report before it renders without them. */
 const FONT_GRACE_MS  = 8000;
@@ -298,16 +320,23 @@ ${opts.body}
  * @param {string} names
  * @returns {{html: string, nextPage: number}}
  */
-function sectionPagesHtml(consultation, dims, mode, names) {
+function sectionPagesHtml(consultation, dims, mode, names, blocks) {
   const labels = DIMENSION_LABELS[mode] || DIMENSION_LABELS.coppia;
   const kind   = (REPORT_KIND[mode] || REPORT_KIND.coppia).kind;
 
   let pageNo = 2;
   const pages = [];
 
+  // Which chapters this order includes. null is the whole reading, which is
+  // what a full purchase and every older order mean.
+  const allowed = reportBlocks.sectionsFor(blocks !== undefined ? blocks : null);
+
   for (const page of SECTION_PAGES) {
-    // A page whose sections are all missing is not printed at all.
-    const present = page.keys.filter(function (k) { return consultation[k]; });
+    // A page whose sections are all missing — never generated, or not part of
+    // this order — is not printed at all.
+    const present = page.keys.filter(function (k) {
+      return consultation[k] && allowed.indexOf(k) !== -1;
+    });
     if (present.length === 0) { continue; }
 
     const blocks = present.map(function (key, i) {
@@ -443,7 +472,7 @@ function giftPageHtml(calculationId, mode, names, pageNo) {
  * @returns {string} absolute path to generated PDF
  */
 async function generatePremiumPDF(data, calculationId) {
-  const outPath = path.join(REPORTS_DIR, 'report_' + calculationId + '.pdf');
+  const outPath = path.join(REPORTS_DIR, reportFileName(calculationId, data.blocks));
 
   // Skip if already exists
   if (fs.existsSync(outPath)) {
@@ -563,7 +592,7 @@ function buildReportHtml(data, calculationId) {
   const name2 = p2.name || 'Partner B';
   const names = name1 + ' & ' + name2;
 
-  const sections = sectionPagesHtml(consult, dims, mode, names);
+  const sections = sectionPagesHtml(consult, dims, mode, names, data.blocks);
 
   // ── Substitutions ──────────────────────────────────────────────────────────
   const replacements = {
@@ -599,4 +628,4 @@ function buildReportHtml(data, calculationId) {
   return html;
 }
 
-module.exports = { generatePremiumPDF, buildReportHtml };
+module.exports = { generatePremiumPDF, buildReportHtml, reportFileName };

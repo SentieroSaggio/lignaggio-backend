@@ -89,6 +89,17 @@ try { db.exec('ALTER TABLE sessions ADD COLUMN bonus_focus TEXT'); } catch (_) {
 try { db.exec('ALTER TABLE sessions ADD COLUMN bonus_json TEXT'); } catch (_) {}
 try { db.exec('ALTER TABLE sessions ADD COLUMN bonus_status TEXT'); } catch (_) {}
 try { db.exec('ALTER TABLE sessions ADD COLUMN bonus_generated_at INTEGER'); } catch (_) {}
+
+// Which chapters of the reading this order includes. NULL means the whole
+// thing — every order placed before the reading could be bought in pieces, and
+// every full purchase since. A JSON array names the blocks that were paid for.
+try { db.exec('ALTER TABLE sessions ADD COLUMN blocks_json TEXT'); } catch (_) {}
+// The card Stripe saved at the first purchase (setup_future_usage). With it a
+// chapter can be added from the result page in one tap, with no card form.
+try { db.exec('ALTER TABLE sessions ADD COLUMN stripe_customer_id TEXT'); } catch (_) {}
+try { db.exec('ALTER TABLE sessions ADD COLUMN stripe_pm_id TEXT'); } catch (_) {}
+// Second abandoned-cart email, a day later, with the price in it.
+try { db.exec('ALTER TABLE session_emails ADD COLUMN abandoned2_sent INTEGER DEFAULT 0'); } catch (_) {}
 // Which two people this order is about: 'coppia' (default) or 'famiglia'
 // (a parent and a child). The calculation is the same; the reading is not.
 try { db.exec("ALTER TABLE sessions ADD COLUMN mode TEXT DEFAULT 'coppia'"); } catch (_) {}
@@ -202,6 +213,47 @@ db.exec(`
     unsubscribed   INTEGER NOT NULL DEFAULT 0,
     created_at     INTEGER
   );
+
+  -- Lignaggio Plus — the monthly reading the subscription actually buys.
+  --
+  -- One row per subscriber per month. The primary key is what makes the
+  -- sweeper safe: a restart, a redeploy or two overlapping sweeps can all try
+  -- to enqueue the same month, and only the first one wins. Nobody is ever
+  -- mailed the same forecast twice.
+  CREATE TABLE IF NOT EXISTS monthly_forecast (
+    subscription_id TEXT NOT NULL,
+    period          TEXT NOT NULL,          -- 'YYYY-MM'
+    email           TEXT NOT NULL,
+    name            TEXT,
+    birth_date      TEXT,
+    status          TEXT NOT NULL DEFAULT 'pending',  -- pending | sent | failed | skipped
+    forecast_json   TEXT,
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    last_error      TEXT,
+    sent_at         INTEGER,
+    created_at      INTEGER,
+    PRIMARY KEY (subscription_id, period)
+  );
+
+  -- Unsubscribing from the monthly email is not the same as cancelling the
+  -- subscription, and must not be: someone can want the reading to stop
+  -- arriving while their billing is handled separately. Keyed by email so one
+  -- opt-out covers every subscription that address ever had.
+  CREATE TABLE IF NOT EXISTS monthly_optout (
+    email      TEXT PRIMARY KEY,
+    created_at INTEGER
+  );
+
+  -- The day-before-billing notice for Lignaggio Plus. One row per
+  -- subscription: claiming the row is what guarantees a single email, however
+  -- many times the hourly sweep sees the same trial.
+  CREATE TABLE IF NOT EXISTS trial_reminders (
+    subscription_id TEXT PRIMARY KEY,
+    email           TEXT NOT NULL,
+    trial_end       INTEGER,
+    sent_at         INTEGER,
+    created_at      INTEGER
+  );
 `);
 // Normalize timestamps stored as Unix seconds → milliseconds
 // Any value < 10 billion is seconds-based (covers all dates up to ~2286 in seconds)
@@ -250,6 +302,10 @@ const stmtUpdatePreview = db.prepare(`
 const stmtUpdateMode = db.prepare(`
   UPDATE sessions SET mode = @mode
    WHERE id = @id AND (mode IS NULL OR mode = 'coppia')
+`);
+
+const stmtSetBlocks = db.prepare(`
+  UPDATE sessions SET blocks_json = @blocks_json WHERE id = @id
 `);
 
 const stmtMarkPaid = db.prepare(`
@@ -389,6 +445,177 @@ const stmtGetRitual = db.prepare(`
   SELECT * FROM ritual_progress WHERE calculation_id = ?
 `);
 
+// ── Lignaggio Plus — monthly forecast statements ─────────────────────────────
+const stmtEnqueueMonthly = db.prepare(`
+  INSERT OR IGNORE INTO monthly_forecast
+    (subscription_id, period, email, name, birth_date, status, attempts, created_at)
+  VALUES (@subscription_id, @period, @email, @name, @birth_date, 'pending', 0, @created_at)
+`);
+
+const stmtMonthlyDue = db.prepare(`
+  SELECT subscription_id, period, email, name, birth_date, attempts
+    FROM monthly_forecast
+   WHERE status = 'pending'
+     AND attempts < @max_attempts
+   ORDER BY created_at ASC
+   LIMIT @limit
+`);
+
+const stmtMonthlySent = db.prepare(`
+  UPDATE monthly_forecast
+     SET status = 'sent', forecast_json = @forecast_json, sent_at = @sent_at, last_error = NULL
+   WHERE subscription_id = @subscription_id AND period = @period
+`);
+
+const stmtMonthlyFailed = db.prepare(`
+  UPDATE monthly_forecast
+     SET attempts = attempts + 1,
+         last_error = @last_error,
+         status = CASE WHEN attempts + 1 >= @max_attempts THEN 'failed' ELSE 'pending' END
+   WHERE subscription_id = @subscription_id AND period = @period
+`);
+
+const stmtMonthlySkipped = db.prepare(`
+  UPDATE monthly_forecast
+     SET status = 'skipped', last_error = @last_error
+   WHERE subscription_id = @subscription_id AND period = @period
+`);
+
+const stmtGetMonthly = db.prepare(`
+  SELECT * FROM monthly_forecast WHERE subscription_id = ? AND period = ?
+`);
+
+const stmtMonthlyStats = db.prepare(`
+  SELECT status, COUNT(*) AS n FROM monthly_forecast WHERE period = ? GROUP BY status
+`);
+
+const stmtClaimTrialReminder = db.prepare(`
+  INSERT OR IGNORE INTO trial_reminders (subscription_id, email, trial_end, created_at)
+  VALUES (@subscription_id, @email, @trial_end, @created_at)
+`);
+const stmtTrialReminderSent = db.prepare(`
+  UPDATE trial_reminders SET sent_at = @sent_at WHERE subscription_id = @subscription_id
+`);
+const stmtReleaseTrialReminder = db.prepare(`
+  DELETE FROM trial_reminders WHERE subscription_id = ? AND sent_at IS NULL
+`);
+const stmtGetTrialReminder = db.prepare(`
+  SELECT * FROM trial_reminders WHERE subscription_id = ?
+`);
+
+/** Claims the reminder for one trial. False when it was already claimed. */
+function claimTrialReminder(subscriptionId, email, trialEndSec) {
+  const r = stmtClaimTrialReminder.run({
+    subscription_id: subscriptionId, email: email,
+    trial_end: Number(trialEndSec) || null, created_at: Date.now(),
+  });
+  return r.changes > 0;
+}
+function markTrialReminderSent(subscriptionId) {
+  stmtTrialReminderSent.run({ subscription_id: subscriptionId, sent_at: Date.now() });
+}
+/** Gives a claim back after a transient send failure, so the next sweep retries. */
+function releaseTrialReminder(subscriptionId) {
+  stmtReleaseTrialReminder.run(subscriptionId);
+}
+function getTrialReminder(subscriptionId) {
+  return stmtGetTrialReminder.get(subscriptionId) || null;
+}
+
+const stmtIsOptedOut = db.prepare(`
+  SELECT 1 FROM monthly_optout WHERE email = ?
+`);
+
+const stmtOptOut = db.prepare(`
+  INSERT OR IGNORE INTO monthly_optout (email, created_at) VALUES (?, ?)
+`);
+
+/* The birth date a subscriber gave when they took the quiz. They paid as
+   partner 1, so partner 1 is whose month this is. Most recent session wins:
+   somebody who retook the quiz with a corrected date meant the correction. */
+const stmtBirthByEmail = db.prepare(`
+  SELECT s.partner1_name AS name, s.partner1_birth AS birth_date
+    FROM session_emails se
+    JOIN sessions s ON s.id = se.calculation_id
+   WHERE se.email = ?
+     AND s.partner1_birth IS NOT NULL
+     AND TRIM(s.partner1_birth) != ''
+   ORDER BY s.created_at DESC
+   LIMIT 1
+`);
+
+/**
+ * Claims one subscriber-month. Returns false when it was already claimed,
+ * which is how the sweeper stays safe across restarts and overlapping runs.
+ * @returns {boolean} true when this call created the row
+ */
+function enqueueMonthlyForecast(row) {
+  const res = stmtEnqueueMonthly.run({
+    subscription_id: row.subscriptionId,
+    period:          row.period,
+    email:           row.email,
+    name:            row.name || null,
+    birth_date:      row.birthDate || null,
+    created_at:      Date.now(),
+  });
+  return res.changes > 0;
+}
+
+function getMonthlyForecastDue(limit, maxAttempts) {
+  return stmtMonthlyDue.all({
+    limit:        limit || 25,
+    max_attempts: maxAttempts || 3,
+  });
+}
+
+function markMonthlyForecastSent(subscriptionId, period, forecast) {
+  stmtMonthlySent.run({
+    subscription_id: subscriptionId,
+    period:          period,
+    forecast_json:   JSON.stringify(forecast || {}),
+    sent_at:         Date.now(),
+  });
+}
+
+function markMonthlyForecastFailed(subscriptionId, period, message, maxAttempts) {
+  stmtMonthlyFailed.run({
+    subscription_id: subscriptionId,
+    period:          period,
+    last_error:      String(message || '').slice(0, 500),
+    max_attempts:    maxAttempts || 3,
+  });
+}
+
+function markMonthlyForecastSkipped(subscriptionId, period, reason) {
+  stmtMonthlySkipped.run({
+    subscription_id: subscriptionId,
+    period:          period,
+    last_error:      String(reason || '').slice(0, 500),
+  });
+}
+
+function getMonthlyForecast(subscriptionId, period) {
+  return stmtGetMonthly.get(subscriptionId, period) || null;
+}
+
+function getMonthlyForecastStats(period) {
+  const out = {};
+  for (const r of stmtMonthlyStats.all(period)) { out[r.status] = r.n; }
+  return out;
+}
+
+function isMonthlyOptedOut(email) {
+  return !!stmtIsOptedOut.get(String(email || '').trim().toLowerCase());
+}
+
+function optOutMonthly(email) {
+  stmtOptOut.run(String(email || '').trim().toLowerCase(), Date.now());
+}
+
+function findBirthDateByEmail(email) {
+  return stmtBirthByEmail.get(String(email || '').trim()) || null;
+}
+
 // ── Analisi Focus statements ─────────────────────────────────────────────────
 const stmtGetBonusState = db.prepare(`
   SELECT bonus_focus, bonus_json, bonus_status, bonus_generated_at
@@ -511,6 +738,28 @@ const stmtGetAbandonedCandidates = db.prepare(`
     AND se.created_at < @cutoff
 `);
 
+/* The second nudge goes only to people who already got the first one and
+   still have not paid. The score rides along so the email can quote it. */
+const stmtGetAbandoned2Candidates = db.prepare(`
+  SELECT se.calculation_id, se.email, s.partner1_name, s.partner2_name, s.compatibility_json
+  FROM session_emails se
+  LEFT JOIN sessions s ON s.id = se.calculation_id
+  WHERE se.abandoned_sent = 1
+    AND COALESCE(se.abandoned2_sent, 0) = 0
+    AND (s.payment_status IS NULL OR s.payment_status != 'paid')
+    AND se.created_at < @cutoff
+`);
+const stmtMarkAbandoned2Sent = db.prepare(`
+  UPDATE session_emails SET abandoned2_sent = 1 WHERE calculation_id = ?
+`);
+
+const stmtSaveStripeCustomer = db.prepare(`
+  UPDATE sessions SET stripe_customer_id = @customer, stripe_pm_id = @pm WHERE id = @id
+`);
+const stmtGetStripeCustomer = db.prepare(`
+  SELECT stripe_customer_id AS customer, stripe_pm_id AS pm FROM sessions WHERE id = ?
+`);
+
 // ── Public API ───────────────────────────────────────────────────────────────
 
 /**
@@ -576,6 +825,76 @@ function markSessionPaid(calculationId, accessToken, selectedPrice) {
  */
 function getSession(calculationId) {
   return stmtGetSession.get(calculationId) || null;
+}
+
+/**
+ * The chapters an order includes.
+ *
+ * null is "everything": that is what a full purchase means, and what every
+ * order predating the à-la-carte listing means. An array names the blocks.
+ *
+ * @param {string} calculationId
+ * @returns {string[]|null}
+ */
+function getSessionBlocks(calculationId) {
+  const row = stmtGetSession.get(calculationId);
+  if (!row || !row.blocks_json) { return null; }
+  try {
+    const parsed = JSON.parse(row.blocks_json);
+    return Array.isArray(parsed) ? parsed : null;
+  } catch (_) {
+    // A corrupted list must not lock a paying customer out of their reading.
+    return null;
+  }
+}
+
+/**
+ * Adds chapters to an order, keeping what it already had.
+ *
+ * Additive on purpose: a second purchase extends the first rather than
+ * replacing it, and buying a block twice cannot take one away.
+ *
+ * @param {string} calculationId
+ * @param {string[]} blockIds
+ */
+function addSessionBlocks(calculationId, blockIds) {
+  if (!Array.isArray(blockIds) || blockIds.length === 0) { return; }
+
+  const row = stmtGetSession.get(calculationId);
+  if (!row) { return; }
+
+  // Already whole: there is nothing to add, and writing a list would narrow it.
+  if (row.payment_status === 'paid' && !row.blocks_json) { return; }
+
+  let current = [];
+  try { current = row.blocks_json ? JSON.parse(row.blocks_json) : []; } catch (_) { current = []; }
+  if (!Array.isArray(current)) { current = []; }
+
+  const merged = current.slice();
+  blockIds.forEach(function (id) {
+    if (merged.indexOf(id) === -1) { merged.push(id); }
+  });
+
+  stmtSetBlocks.run({ id: calculationId, blocks_json: JSON.stringify(merged) });
+}
+
+/**
+ * Marks an order as covering the entire reading.
+ * @param {string} calculationId
+ */
+/**
+ * Records exactly which chapters a FIRST purchase bought. Unlike
+ * addSessionBlocks it writes even on a paid row with no list yet — that is
+ * precisely the moment a bundle has to be recorded, right after the order is
+ * marked paid. Never call it for a later top-up: that would narrow the order.
+ */
+function setSessionBlocks(calculationId, blockIds) {
+  if (!Array.isArray(blockIds)) { return; }
+  stmtSetBlocks.run({ id: calculationId, blocks_json: JSON.stringify(blockIds) });
+}
+
+function clearSessionBlocks(calculationId) {
+  stmtSetBlocks.run({ id: calculationId, blocks_json: null });
 }
 
 /**
@@ -1015,6 +1334,27 @@ function getBonusAnalysis(calculationId) {
 function getAbandonedCandidates(minAgeMs) {
   const cutoff = Date.now() - minAgeMs;
   return stmtGetAbandonedCandidates.all({ cutoff });
+}
+
+function getAbandoned2Candidates(minAgeMs) {
+  const cutoff = Date.now() - minAgeMs;
+  return stmtGetAbandoned2Candidates.all({ cutoff });
+}
+
+function markAbandoned2Sent(calculationId) {
+  stmtMarkAbandoned2Sent.run(calculationId);
+}
+
+/** Remembers the card Stripe saved, so later chapters need no card form. */
+function saveStripeCustomer(calculationId, customerId, paymentMethodId) {
+  if (!calculationId || !customerId) { return; }
+  stmtSaveStripeCustomer.run({ id: calculationId, customer: customerId, pm: paymentMethodId || null });
+}
+
+/** @returns {{customer: string, pm: string}|null} null when nothing was saved */
+function getStripeCustomer(calculationId) {
+  const row = stmtGetStripeCustomer.get(calculationId);
+  return row && row.customer ? row : null;
 }
 
 // ── Admin queries ────────────────────────────────────────────────────────────
@@ -1485,10 +1825,28 @@ function deleteSession(id) {
 }
 
 module.exports = {
+  claimTrialReminder,
+  markTrialReminderSent,
+  releaseTrialReminder,
+  getTrialReminder,
+  enqueueMonthlyForecast,
+  getMonthlyForecastDue,
+  markMonthlyForecastSent,
+  markMonthlyForecastFailed,
+  markMonthlyForecastSkipped,
+  getMonthlyForecast,
+  getMonthlyForecastStats,
+  isMonthlyOptedOut,
+  optOutMonthly,
+  findBirthDateByEmail,
   insertSession,
   updateSessionPreview,
   markSessionPaid,
   getSession,
+  getSessionBlocks,
+  addSessionBlocks,
+  clearSessionBlocks,
+  setSessionBlocks,
   insertConsultation,
   getConsultation,
   saveSessionEmail,
@@ -1506,7 +1864,12 @@ module.exports = {
   claimPostback,
   finishPostback,
   getPostback,
-  getAbandonedCandidates,  saveBonusCode,
+  getAbandonedCandidates,
+  getAbandoned2Candidates,
+  markAbandoned2Sent,
+  saveStripeCustomer,
+  getStripeCustomer,
+  saveBonusCode,
   getBonusCode,
   claimBonusFocus,
   saveBonusAnalysis,

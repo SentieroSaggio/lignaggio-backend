@@ -11,7 +11,7 @@ const crypto = require('crypto');
 const db = require('../db');
 
 // ── PDF generator ─────────────────────────────────────────────────────────
-const { generatePremiumPDF } = require('../services/pdfGenerator');
+const { generatePremiumPDF, reportFileName } = require('../services/pdfGenerator');
 
 /**
  * In-flight PDF builds, keyed by calculation id.
@@ -32,16 +32,21 @@ const _pdfInFlight = new Map();
  * @returns {Promise<string>} path to the generated file
  */
 function ensurePremiumPDF(calculationId, pdfData) {
-  const running = _pdfInFlight.get(calculationId);
+  // Keyed by the file that will be written, not by the order: one buyer can
+  // legitimately have two different reports in flight — the chapters they had,
+  // and the fuller set they just bought.
+  const key = reportFileName(calculationId, pdfData && pdfData.blocks);
+
+  const running = _pdfInFlight.get(key);
   if (running) {
-    console.log('[pdf] Build already in flight for', calculationId, '— joining it.');
+    console.log('[pdf] Build already in flight for', key, '— joining it.');
     return running;
   }
 
   const build = generatePremiumPDF(pdfData, calculationId)
-    .finally(function () { _pdfInFlight.delete(calculationId); });
+    .finally(function () { _pdfInFlight.delete(key); });
 
-  _pdfInFlight.set(calculationId, build);
+  _pdfInFlight.set(key, build);
   return build;
 }
 
@@ -55,6 +60,10 @@ const { isPermanentSmtpFailure } = require('../services/smtp');
 // public/js/fiamme-bond.js — the funnel and the reading must never disagree
 // about which bond a couple has, so both read the same table.
 const fiammeBond = require('../services/fiammeBond');
+// The reading split into buyable chapters. Byte-identical to
+// public/js/report-blocks.js so the price the page shows and the price the
+// server charges can never disagree.
+const reportBlocks = require('../services/reportBlocks');
 
 // ── Google Analytics 4 reporting (read-only, admin panel only) ────────────
 const googleAnalytics = require('../services/googleAnalytics');
@@ -71,6 +80,11 @@ const PRICE_MAP = {
   '13': process.env.PRICE_13_ID,
   '17.67': process.env.PRICE_1767_ID,
   '19': process.env.SUBSCRIPTION_PRICE_ID,
+  // Post-purchase unlocks on the result page. The reading is already written,
+  // so these are pure margin — and none of them may ever start a subscription.
+  '0.99': process.env.PRICE_099_ID,
+  '1.99': process.env.PRICE_199_ID,
+  '2.99': process.env.PRICE_299_ID,
 };
 
 const AUTO_SUBSCRIPTION_PRICE_KEYS = new Set(['1.59', '3.59', '7.59', '5', '9', '13', '17.67']);
@@ -283,9 +297,35 @@ app.post(
         // ── New compatibility quiz: mark result as paid, persist to DB ──────────
         const calculationId = metadata.calculation_id;
         const selectedPrice  = metadata.selected_price || metadata.price || null;
-        if (calculationId) {
+        // A one-tap chapter top-up pays through a PaymentIntent, not Checkout,
+        // so it lands here. /api/blocks/unlock already granted the chapters
+        // synchronously; this is the safety net for a process that died between
+        // the charge and the grant. addSessionBlocks merges, so nothing doubles.
+        if (calculationId && metadata.product === 'report_blocks') {
+          const topUp = String(metadata.blocks || '').split(',')
+            .map(function (x) { return x.trim(); })
+            .filter(function (x) { return x && reportBlocks.BLOCKS[x]; });
+          if (topUp.length) {
+            try {
+              grantBlocks(calculationId, topUp);
+              console.log('[blocks] One-tap top-up confirmed by webhook:', topUp.join(','), 'for', calculationId);
+            } catch (err) {
+              console.error('[blocks] Webhook grant failed for', calculationId, '—', err.message);
+            }
+          }
+        }
+
+        // Everything below is the FIRST purchase: a top-up must not re-mark
+        // the order, rotate its token, narrow its list or start a trial.
+        if (calculationId && metadata.product !== 'report_blocks') {
           console.log('[webhook] payment_intent.succeeded — calculation_id:', calculationId);
           markResultAsPaid(calculationId, selectedPrice);
+          try {
+            applyFirstPurchaseBundle(calculationId, selectedPrice);
+            db.saveStripeCustomer(calculationId, customerId, paymentMethodId);
+          } catch (err) {
+            console.error('[blocks] bundle / saved-card step failed for', calculationId, '—', err.message);
+          }
           // Fire-and-forget: generate full consultation asynchronously after payment.
           // Do NOT await — webhook must respond to Stripe quickly (< 30 s).
           generateFullConsultation(calculationId).catch(function (err) {
@@ -382,6 +422,43 @@ app.post(
               });
             } else {
               console.log('[bonus] Extra lens already claimed — ignoring retry for', cid, focus);
+            }
+          }
+        }
+
+        // Chapters of the reading, bought on their own or added to an order
+        // that already has some.
+        if (metadata.product === 'report_blocks') {
+          const cid = metadata.calculation_id;
+          const ids = String(metadata.blocks || '')
+            .split(',')
+            .map(function (s) { return s.trim(); })
+            .filter(function (s) { return s && reportBlocks.BLOCKS[s]; });
+
+          if (cid && ids.length && session.payment_status === 'paid') {
+            try {
+              // addSessionBlocks merges, so a webhook retry adds nothing twice.
+              db.addSessionBlocks(cid, ids);
+
+              // A chapter buyer has paid: the result page is theirs to open,
+              // limited to what they bought. Without this the order stays
+              // 'pending' and /api/result refuses them their own purchase.
+              const row = db.getSession(cid);
+              if (row && row.payment_status !== 'paid') {
+                db.markSessionPaid(cid, crypto.randomBytes(24).toString('hex'), null);
+              }
+
+              // Owning every purchasable block is the whole reading; storing it
+              // as "all" keeps later logic from re-checking six ids.
+              const owned = db.getSessionBlocks(cid) || [];
+              const everyPaidBlock = reportBlocks.purchasable()
+                .every(function (b) { return owned.indexOf(b.id) !== -1; });
+              if (everyPaidBlock) { db.clearSessionBlocks(cid); }
+
+              console.log('[blocks] Paid:', ids.join(','), 'for', cid,
+                          everyPaidBlock ? '— now complete' : '');
+            } catch (err) {
+              console.error('[blocks] Could not grant blocks for', cid, err.message);
             }
           }
         }
@@ -514,15 +591,19 @@ function generateAccessToken(calculationId) {
  * Marks a generated result as paid and issues an access token.
  * Persists status to SQLite and updates the in-memory cache.
  */
-function markResultAsPaid(calculationId) {
+function markResultAsPaid(calculationId, selectedPrice) {
   const token    = generateAccessToken(calculationId);
   const grantedAt = new Date().toISOString();
 
   // ── Persist to DB ──────────────────────────────────────────────────────────
   // If the session row exists update it; if it doesn't (webhook beat the preview
   // call) the DB update is a no-op — generateFullConsultation will retry.
+  //
+  // The price travels with the row. Every caller already passed it and the DB
+  // layer already stored it, but this signature dropped it on the floor — so
+  // 77 paid orders carried no amount and the dashboard reported €0 revenue.
   try {
-    db.markSessionPaid(calculationId, token);
+    db.markSessionPaid(calculationId, token, selectedPrice || null);
     console.log('[db] Session marked paid in DB for calculation_id:', calculationId);
     // Generate bonus code server-side (idempotent)
     try {
@@ -1427,6 +1508,10 @@ async function runFullConsultation(calculationId) {
         partner2:      partnerData.partner2,
         compatibility: partnerData.compatibility,
         consultation:  parsed,
+        // Which chapters this order includes; null is the whole reading.
+        blocks:        (function () {
+          try { return db.getSessionBlocks(calculationId); } catch (_) { return null; }
+        }()),
       };
       ensurePremiumPDF(calculationId, pdfData).then(function (pdfPath) {
         console.log('[pdf] Premium PDF ready for:', calculationId, pdfPath);
@@ -2063,6 +2148,59 @@ app.post('/api/generate-consultation', async (req, res) => {
 });
 
 // ── GET /api/result?cid=... ────────────────────────────────────────
+/**
+ * The reading, with the unpaid chapters taken out.
+ *
+ * The whole text is generated in one go and stored in one row, so without this
+ * the API would hand every buyer the sections they did not buy — the page
+ * would hide them and the network tab would not.
+ *
+ * @param {object|null} consultation
+ * @param {string[]|null} owned  null for the whole reading
+ * @returns {object|null}
+ */
+function gateConsultation(consultation, owned) {
+  if (!consultation || owned === null || owned === undefined) { return consultation; }
+
+  const allowed = reportBlocks.sectionsFor(owned);
+  const out = {};
+  Object.keys(consultation).forEach(function (key) {
+    if (allowed.indexOf(key) !== -1) { out[key] = consultation[key]; }
+  });
+  return out;
+}
+
+/**
+ * One opening sentence per locked block, so the page can show what is behind
+ * the lock in the couple's own words rather than in a generic blurb.
+ *
+ * @param {object|null} consultation
+ * @param {string[]|null} owned
+ * @returns {Object<string, string>} block id → sentence; empty when all is owned
+ */
+function lockedTeasers(consultation, owned) {
+  if (!consultation || owned === null || owned === undefined) { return {}; }
+
+  const out = {};
+  reportBlocks.blockList().forEach(function (block) {
+    if (reportBlocks.owns(owned, block.id)) { return; }
+
+    // The first section of the block that actually has text.
+    const key = block.sections.find(function (k) { return consultation[k]; });
+    if (!key) { return; }
+
+    const text = String(consultation[key]).trim();
+    const stop = text.search(/[.!?…](\s|$)/);
+    // A whole first sentence is left as it is: it already ends, and adding an
+    // ellipsis to it only produces ".…". The ellipsis belongs to the other
+    // case, where the cut lands mid-sentence and the reader needs telling.
+    out[block.id] = (stop > 0 && stop < 160)
+      ? text.slice(0, stop + 1)
+      : text.slice(0, 140).replace(/\s+\S*$/, '') + '…';
+  });
+  return out;
+}
+
 app.get('/api/result', async (req, res) => {
   const { cid, token } = req.query;
 
@@ -2165,7 +2303,14 @@ app.get('/api/result', async (req, res) => {
     const resultLocked = stored.result || {};
     const resultReady  = consultation !== null;
 
-    console.log('[api/result] Access granted for cid:', cid, '— resultReady:', resultReady);
+    // ── Which chapters this order includes ────────────────────────────────
+    // null means the whole reading: a full purchase, or any order placed
+    // before the reading could be bought in pieces.
+    let ownedBlocks = null;
+    try { ownedBlocks = db.getSessionBlocks(cid); } catch (_) { ownedBlocks = null; }
+
+    console.log('[api/result] Access granted for cid:', cid, '— resultReady:', resultReady,
+                '— blocks:', ownedBlocks ? ownedBlocks.join(',') : 'all');
 
     res.json({
       success:       true,
@@ -2173,7 +2318,12 @@ app.get('/api/result', async (req, res) => {
       paymentStatus: 'paid',
       resultReady,
       compatibility: compatOut,
-      consultation,
+      // Only the chapters that were paid for come back in full. The rest are
+      // reduced to their opening sentence: enough for the page to show what is
+      // behind the lock, not enough to make buying it pointless.
+      consultation:  gateConsultation(consultation, ownedBlocks),
+      blocks:        ownedBlocks,
+      lockedTeasers: lockedTeasers(consultation, ownedBlocks),
       preview:       stored.preview || {},
       imageUrl:      resultLocked.imageUrl || null,
       pdfUrl:        resultLocked.pdfUrl   || null,
@@ -2280,6 +2430,25 @@ function _buildConsultBody(consultation, p1Name, p2Name) {
   return html;
 }
 
+/**
+ * The consultation reduced to the chapters an order owns — for email bodies.
+ * A 1,59 € buyer must not find the whole reading in the inbox while the page
+ * shows one chapter: every email built from a consultation goes through here.
+ * @param {object} consultation
+ * @param {string} calculationId
+ * @returns {object}
+ */
+function gateForEmail(consultation, calculationId) {
+  let owned = null;
+  try { owned = db.getSessionBlocks(calculationId); } catch (_) { owned = null; }
+  const allowed = reportBlocks.sectionsFor(owned);
+  const out = {};
+  Object.keys(consultation || {}).forEach(function (k) {
+    if (allowed.indexOf(k) !== -1) { out[k] = consultation[k]; }
+  });
+  return out;
+}
+
 function _createTransporter() {
   return nodemailer.createTransport({
     host:   process.env.SMTP_HOST || 'smtp.ionos.it',
@@ -2325,7 +2494,7 @@ async function sendConsultationEmail(calculationId, consultation, partnerData) {
 
   const resultUrl = SITE_URL + '/result-unlocked.html?cid=' + encodeURIComponent(calculationId);
   const giftUrl   = SITE_URL + '/bonus.html?cid=' + encodeURIComponent(calculationId);
-  const bodyHtml  = _buildConsultBody(consultation, p1Name, p2Name);
+  const bodyHtml  = _buildConsultBody(gateForEmail(consultation, calculationId), p1Name, p2Name);
   const bonusCode = db.getBonusCode(calculationId);
 
   // The gift lives on the site, not in this email: choosing a lens is the
@@ -2465,6 +2634,8 @@ setInterval(checkAbandonedSessions, 5 * 60 * 1000); // every 5 minutes
 // paid for by the single generation the buyer already triggered.
 // =====================================================
 
+/* The ten base sections, in the order the model writes one exercise each. */
+const ESERCIZI_SECTION_ORDER = ['panorama','partner1','partner2','couple','anima','karma','intimita','finanze','potentiale','consiglio'];
 const RITUAL_INTERVAL_MS  = 24 * 60 * 60 * 1000;  // one exercise per day
 const RITUAL_SWEEP_MS     = 30 * 60 * 1000;       // check for due exercises twice an hour
 const RITUAL_MAX_PER_RUN  = 25;
@@ -2502,7 +2673,16 @@ async function sendRitualDay(row) {
 
   const consultRow = db.getConsultation(cid);
   const consultation = consultRow ? safeParseJson(consultRow.consultation_json) : null;
-  const exercises = (consultation && consultation.esercizi) || [];
+  // One exercise per base section, in section order. A partial order gets
+  // only the exercises for chapters it can read — an exercise for a chapter
+  // that is still locked would be homework for a page nobody has seen.
+  let ownedForRitual = null;
+  try { ownedForRitual = db.getSessionBlocks(cid); } catch (_) { ownedForRitual = null; }
+  const allowedRitual = reportBlocks.sectionsFor(ownedForRitual);
+  const exercises = ((consultation && consultation.esercizi) || []).filter(function (ex, i) {
+    const key = ESERCIZI_SECTION_ORDER[i];
+    return !key || allowedRitual.indexOf(key) !== -1;
+  });
 
   const exercise = exercises[day - 1];
   if (!exercise) {
@@ -2584,6 +2764,374 @@ async function sweepRitual() {
 }
 
 setInterval(sweepRitual, RITUAL_SWEEP_MS);
+
+// =====================================================
+// LIGNAGGIO PLUS — the monthly reading the subscription buys
+// =====================================================
+/*
+   The €19/month subscription used to charge for nothing. It now delivers one
+   personal reading on the 1st of each month, built from the subscriber's own
+   birth date — nine sections, concrete, generated per person.
+
+   Shape of the job, and why:
+
+     · Enrolment runs on days 1–3 of the month, not only on the 1st. Render
+       restarts, redeploys and cold starts all happen, and a three-day window
+       means none of them can cost a subscriber their month. Enrolment is an
+       INSERT OR IGNORE on (subscription_id, period), so running it sixty times
+       does exactly as much as running it once.
+
+     · Sending is a separate pass over whatever is pending. Generation costs an
+       OpenAI call and sending costs an SMTP round trip, so the sweep takes a
+       small batch each hour rather than trying to mail everyone at once.
+
+     · A subscriber with no readable birth date is marked 'skipped', not
+       'failed'. There is nothing to retry: they never gave us a date.
+*/
+
+const monthly = require('../services/monthlyForecast');
+
+const MONTHLY_SWEEP_MS     = 60 * 60 * 1000;  // hourly
+const MONTHLY_MAX_ATTEMPTS = 3;
+const MONTHLY_BATCH        = 10;              // forecasts generated per sweep
+const MONTHLY_ENROL_DAYS   = 3;               // enrol on days 1..3 of the month
+
+/**
+ * Today in Rome, as the site's customers experience it. A UTC date would send
+ * the January email on the 31st of December for two hours every year.
+ * @param {Date} [now]
+ * @returns {{period: string, day: number}}
+ */
+function romeToday(now) {
+  const iso = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Europe/Rome', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).format(now || new Date());
+  return { period: iso.slice(0, 7), day: Number(iso.slice(8, 10)) };
+}
+
+/**
+ * Signs the unsubscribe link. Without this anyone could unsubscribe anyone
+ * else by editing the address in the URL.
+ * @param {string} email
+ * @returns {string}
+ */
+function monthlyUnsubToken(email) {
+  const secret = process.env.UNSUB_SECRET || process.env.STRIPE_WEBHOOK_SECRET || '';
+  return require('crypto')
+    .createHmac('sha256', secret)
+    .update(String(email || '').trim().toLowerCase())
+    .digest('hex')
+    .slice(0, 32);
+}
+
+/**
+ * Every subscriber who should get a reading this month.
+ * Paginates, because `list` caps at 100 and the list only grows.
+ * @returns {Promise<Array<{id: string, email: string}>>}
+ */
+async function listPlusSubscribers() {
+  if (!SUBSCRIPTION_PRICE_ID) { return []; }
+
+  const out = [];
+  for (const status of ['active', 'trialing']) {
+    let startingAfter;
+    for (;;) {
+      const page = await stripe.subscriptions.list(Object.assign(
+        { price: SUBSCRIPTION_PRICE_ID, status: status, limit: 100 },
+        startingAfter ? { starting_after: startingAfter } : {}
+      ));
+
+      for (const sub of page.data) {
+        let email = (sub.metadata && sub.metadata.email) || '';
+        if (!email && sub.customer) {
+          try {
+            const cust = await stripe.customers.retrieve(sub.customer);
+            email = (cust && cust.email) || '';
+          } catch (_) { /* a deleted customer simply has no email */ }
+        }
+        if (email) { out.push({ id: sub.id, email: email.trim() }); }
+      }
+
+      if (!page.has_more || page.data.length === 0) { break; }
+      startingAfter = page.data[page.data.length - 1].id;
+    }
+  }
+  return out;
+}
+
+/**
+ * Claims this month for every current subscriber. Cheap and idempotent.
+ * @returns {Promise<number>} how many rows this call created
+ */
+async function enrolMonthlySubscribers() {
+  const today = romeToday();
+  if (today.day > MONTHLY_ENROL_DAYS) { return 0; }
+
+  const subs = await listPlusSubscribers();
+  let created = 0;
+
+  for (const sub of subs) {
+    if (db.isMonthlyOptedOut(sub.email)) { continue; }
+
+    const who = db.findBirthDateByEmail(sub.email);
+
+    const isNew = db.enqueueMonthlyForecast({
+      subscriptionId: sub.id,
+      period:         today.period,
+      email:          sub.email,
+      name:           who && who.name,
+      birthDate:      who && who.birth_date,
+    });
+    if (!isNew) { continue; }
+    created++;
+
+    /* No birth date means no reading is possible — retrying would only burn
+       the attempt counter against a row that can never succeed. */
+    if (!who || !monthly.parseBirthDate(who.birth_date)) {
+      db.markMonthlyForecastSkipped(sub.id, today.period, 'no usable birth date on file');
+      console.warn('[plus] No birth date for', sub.email, '— skipped', today.period);
+    }
+  }
+
+  if (created) { console.log('[plus] Enrolled', created, 'subscribers for', today.period); }
+  return created;
+}
+
+/**
+ * Renders one monthly reading as an email.
+ * @param {{forecast: object, anchors: object, name: string, stopUrl: string}} args
+ * @returns {string} HTML
+ */
+function renderMonthlyEmail(args) {
+  const forecast = args.forecast;
+  const anchors  = args.anchors;
+  const name     = (args.name || '').trim();
+  const stopUrl  = args.stopUrl;
+
+  let body = '';
+  for (const key of monthly.MONTHLY_SECTION_KEYS) {
+    const text = forecast[key];
+    if (!text) { continue; }
+    const paragraphs = String(text).split('\n\n').map(function (para) {
+      return '<p style="margin:0 0 12px">' + escapeHtml(para.trim()) + '</p>';
+    }).join('');
+    body += `
+      <div style="margin-bottom:28px">
+        <h3 style="color:#6b21a8;margin:0 0 10px;font-size:16px">${escapeHtml(monthly.MONTHLY_SECTION_TITLES[key] || key)}</h3>
+        ${paragraphs}
+      </div>`;
+  }
+
+  const giorni = anchors.giorniChiave.length ? anchors.giorniChiave.join(' · ') : '—';
+  const mese   = anchors.meseNome.charAt(0).toUpperCase() + anchors.meseNome.slice(1);
+  const support = escapeHtml(process.env.SMTP_USER || 'support@lignaggio.it');
+
+  return `
+    <div style="font-family:sans-serif;max-width:620px;margin:auto;color:#222;line-height:1.6">
+      <div style="background:linear-gradient(135deg,#2a1d05 0%,#1a1207 100%);padding:26px 32px;border-radius:8px 8px 0 0">
+        <p style="margin:0 0 6px 0;color:#e8c96a;font-size:11px;letter-spacing:0.22em;text-transform:uppercase">
+          Lignaggio Plus · La tua lettura mensile
+        </p>
+        <p style="margin:0;color:#fff;font-size:21px;font-weight:700">
+          ${escapeHtml(mese)} ${anchors.year}${name ? ' — ' + escapeHtml(name) : ''}
+        </p>
+      </div>
+
+      <div style="background:#fff;padding:30px 32px;border:1px solid #e5e7eb;border-top:0;border-radius:0 0 8px 8px">
+        <div style="margin:0 0 26px;padding:16px 18px;background:#faf6ea;border-left:3px solid #e8c96a;border-radius:0 8px 8px 0">
+          <p style="margin:0;font-size:13px;color:#3a3320">
+            I numeri di questo mese —
+            Destino <strong>${anchors.destino}</strong> ·
+            Anno Personale <strong>${anchors.annoPersonale}</strong> ·
+            Mese Personale <strong>${anchors.mesePersonale}</strong> ·
+            ${escapeHtml(anchors.segno)}
+          </p>
+          <p style="margin:6px 0 0;font-size:13px;color:#6b6350">
+            Giorni chiave: <strong>${escapeHtml(giorni)}</strong>
+          </p>
+        </div>
+
+        ${body}
+
+        <p style="margin-top:30px;font-size:11px;color:#999;text-align:center;line-height:1.7">
+          Ricevi questa lettura perché il tuo abbonamento Lignaggio Plus è attivo.<br>
+          <a href="${stopUrl}" style="color:#999">non voglio più ricevere la lettura mensile</a> ·
+          per gestire o disdire l’abbonamento scrivi a ${support}
+        </p>
+      </div>
+    </div>`;
+}
+
+/**
+ * Generates and sends whatever is pending, a batch at a time.
+ */
+async function sweepMonthlyForecast() {
+  try {
+    await enrolMonthlySubscribers();
+  } catch (err) {
+    console.error('[plus] enrolment error:', err.message);
+  }
+
+  let due;
+  try {
+    due = db.getMonthlyForecastDue(MONTHLY_BATCH, MONTHLY_MAX_ATTEMPTS);
+  } catch (err) {
+    console.error('[plus] could not read the queue:', err.message);
+    return;
+  }
+
+  for (const row of due) {
+    const sid    = row.subscription_id;
+    const period = row.period;
+
+    try {
+      /* Someone who opted out between enrolment and sending must not be
+         mailed. This is the last gate before an email goes out. */
+      if (db.isMonthlyOptedOut(row.email)) {
+        db.markMonthlyForecastSkipped(sid, period, 'unsubscribed before sending');
+        continue;
+      }
+
+      const anchors = monthly.computeAnchors(row.birth_date, period);
+      if (!anchors) {
+        db.markMonthlyForecastSkipped(sid, period, 'birth date could not be read');
+        continue;
+      }
+
+      const started  = Date.now();
+      const forecast = await monthly.generateMonthlyForecast(openai, anchors, row.name);
+      console.log('[plus] Generated', period, 'for', row.email, 'in', Date.now() - started, 'ms');
+
+      const stopUrl = SITE_URL.replace(/\/$/, '') +
+        '/api/monthly/stop?e=' + encodeURIComponent(row.email) +
+        '&t=' + monthlyUnsubToken(row.email);
+
+      await sendEmail({
+        to:      row.email,
+        subject: 'La tua lettura di ' + anchors.meseNome + ' ' + anchors.year + ' ✦ Lignaggio Plus',
+        html:    renderMonthlyEmail({
+          forecast: forecast, anchors: anchors, name: row.name, stopUrl: stopUrl,
+        }),
+      });
+
+      db.markMonthlyForecastSent(sid, period, forecast);
+    } catch (err) {
+      if (isPermanentSmtpFailure(err)) {
+        db.markMonthlyForecastSkipped(sid, period, 'permanent delivery failure: ' + err.message);
+        console.warn('[plus] Permanent failure for', row.email, '—', err.message);
+      } else {
+        db.markMonthlyForecastFailed(sid, period, err.message, MONTHLY_MAX_ATTEMPTS);
+        console.error('[plus] Failed', period, 'for', row.email, '—', err.message);
+      }
+    }
+  }
+}
+
+setInterval(sweepMonthlyForecast, MONTHLY_SWEEP_MS);
+
+// ── The day-before-billing notice ─────────────────────────────────────────────
+// Nobody was told the day before the trial turned into 19 €/month. Now they
+// are: what Plus delivers, when the first charge lands, and that one reply
+// cancels it. This sends a notice — it never touches the subscription itself.
+const plusReminder = require('../services/plusReminder');
+const TRIAL_REMINDER_SWEEP_MS = 60 * 60 * 1000;
+
+/** Trials ending in the reminder window, with the address to write to. */
+async function listTrialsEndingSoon() {
+  if (!SUBSCRIPTION_PRICE_ID) { return []; }
+  const out = [];
+  let startingAfter;
+  for (;;) {
+    const page = await stripe.subscriptions.list(Object.assign(
+      { price: SUBSCRIPTION_PRICE_ID, status: 'trialing', limit: 100 },
+      startingAfter ? { starting_after: startingAfter } : {}
+    ));
+    for (const sub of page.data) {
+      if (!sub.trial_end || !plusReminder.endsWithinWindow(sub.trial_end)) { continue; }
+      let email = (sub.metadata && sub.metadata.email) || '';
+      if (!email && sub.customer) {
+        try { const c = await stripe.customers.retrieve(sub.customer); email = (c && c.email) || ''; }
+        catch (_) { /* a deleted customer has no address to notify */ }
+      }
+      if (email) {
+        out.push({ id: sub.id, email: email.trim(), trialEnd: sub.trial_end,
+                   name: (sub.metadata && sub.metadata.name) || '' });
+      }
+    }
+    if (!page.has_more || page.data.length === 0) { break; }
+    startingAfter = page.data[page.data.length - 1].id;
+  }
+  return out;
+}
+
+async function sweepTrialReminders() {
+  if (!process.env.SMTP_USER || !process.env.SMTP_PASS) { return; }
+  let trials;
+  try { trials = await listTrialsEndingSoon(); }
+  catch (err) { console.error('[plus] trial reminder: could not list trials —', err.message); return; }
+
+  for (const t of trials) {
+    if (!db.claimTrialReminder(t.id, t.email, t.trialEnd)) { continue; }   // already notified
+    try {
+      const who  = db.findBirthDateByEmail(t.email);
+      const mail = plusReminder.renderTrialReminder({
+        trialEndSec: t.trialEnd,
+        name:        (who && who.name) || t.name || '',
+        support:     process.env.SMTP_USER || 'support@lignaggio.it',
+        amountEur:   19,
+      });
+      await sendEmail({ to: t.email, subject: mail.subject, html: mail.html });
+      db.markTrialReminderSent(t.id);
+      console.log('[plus] Trial reminder sent to', t.email, 'for', t.id, '— ends', new Date(t.trialEnd * 1000).toISOString());
+    } catch (err) {
+      console.error('[plus] Trial reminder failed for', t.email, '—', err.message);
+      // A bounce is final; anything else gets another try next hour.
+      if (!isPermanentSmtpFailure(err)) { db.releaseTrialReminder(t.id); }
+    }
+  }
+}
+
+setInterval(sweepTrialReminders, TRIAL_REMINDER_SWEEP_MS);
+
+// GET /api/monthly/stop?e=…&t=… — one-click unsubscribe from the email footer.
+//
+// Unsubscribing stops the reading, not the billing: cancelling money is not
+// something a link in an email should do silently, so the page says plainly
+// where to go for that.
+app.get('/api/monthly/stop', function (req, res) {
+  const email = String(req.query.e || '').trim();
+  const token = String(req.query.t || '').trim();
+  const support = escapeHtml(process.env.SMTP_USER || 'support@lignaggio.it');
+
+  const page = function (title, message) {
+    res.set('Content-Type', 'text/html; charset=utf-8').send(
+      '<!doctype html><meta charset="utf-8">' +
+      '<meta name="viewport" content="width=device-width,initial-scale=1">' +
+      '<div style="font-family:sans-serif;max-width:520px;margin:12vh auto;padding:0 24px;' +
+      'text-align:center;color:#222;line-height:1.6">' +
+      '<h1 style="font-size:20px;color:#6b21a8">' + escapeHtml(title) + '</h1>' +
+      '<p>' + message + '</p></div>'
+    );
+  };
+
+  if (!email || token !== monthlyUnsubToken(email)) {
+    return page('Link non valido',
+      'Questo link di disiscrizione non è valido. Scrivici a ' + support +
+      ' e ce ne occupiamo noi.');
+  }
+
+  try {
+    db.optOutMonthly(email);
+  } catch (err) {
+    console.error('[plus] opt-out error:', err.message);
+  }
+  console.log('[plus] Unsubscribed from the monthly reading:', email);
+
+  return page('Non riceverai più la lettura mensile',
+    'La lettura di Lignaggio Plus non ti arriverà più.<br><br>' +
+    'Questo <strong>non</strong> annulla l’abbonamento: per disdirlo scrivi a ' +
+    support + ' e lo chiudiamo subito.');
+});
 
 // GET /api/ritual/stop?cid=…&t=… — one-click unsubscribe from the email footer.
 app.get('/api/ritual/stop', function (req, res) {
@@ -2777,7 +3325,12 @@ app.get('/api/report/:calculation_id', function (req, res) {
 
   const path = require('path');
   const fs   = require('fs');
-  const pdfPath = path.join(__dirname, '..', 'storage', 'reports', 'report_' + calculationId + '.pdf');
+  // The file is named after the chapters the order owns — the same rule the
+  // generator uses. A partial order looked here for report_<cid>.pdf while the
+  // generator had written report_<cid>_legame.pdf, and the buyer got a 500.
+  let ownedBlocksForPdf = null;
+  try { ownedBlocksForPdf = db.getSessionBlocks(calculationId); } catch (_) { ownedBlocksForPdf = null; }
+  const pdfPath = path.join(__dirname, '..', 'storage', 'reports', reportFileName(calculationId, ownedBlocksForPdf));
 
   if (!fs.existsSync(pdfPath)) {
     // PDF not yet ready — try to generate it now (await)
@@ -2792,6 +3345,7 @@ app.get('/api/report/:calculation_id', function (req, res) {
       partner2:      { name: row.partner2_name, birthDate: row.partner2_birth, gender: row.partner2_gender },
       compatibility: compat,
       consultation,
+      blocks:        ownedBlocksForPdf,
     };
     ensurePremiumPDF(calculationId, pdfData).then(function () {
       const download = String(req.query.download || '') === 'true';
@@ -3187,6 +3741,318 @@ app.post('/api/bonus/purchase', async function (req, res) {
   }
 });
 
+// ── POST /api/blocks/checkout { cid, blocks: [...] } ──────────────────────────
+// Opens Stripe Checkout for a set of chapters. The tier is computed here from
+// the same table the page used, so a hand-edited request cannot buy six blocks
+// at the one-block price.
+app.post('/api/blocks/checkout', async function (req, res) {
+  const cid = String((req.body && req.body.cid) || '').trim();
+  const wanted = Array.isArray(req.body && req.body.blocks) ? req.body.blocks : [];
+
+  if (!cid) { return res.status(400).json({ success: false, error: 'missing_cid' }); }
+
+  const row = db.getSession(cid);
+  if (!row) { return res.status(404).json({ success: false, error: 'session_not_found' }); }
+
+  // Drop anything unknown, anything free, and anything already owned — nobody
+  // should be charged for a chapter they can already read.
+  let owned = [];
+  try { owned = db.getSessionBlocks(cid) || []; } catch (_) { owned = []; }
+  if (row.payment_status === 'paid' && (!row.blocks_json)) {
+    return res.status(409).json({ success: false, error: 'already_complete' });
+  }
+
+  const ids = wanted
+    .map(function (id) { return String(id || '').trim(); })
+    .filter(function (id, i, arr) {
+      const b = reportBlocks.BLOCKS[id];
+      return b && !b.free && owned.indexOf(id) === -1 && arr.indexOf(id) === i;
+    });
+
+  if (ids.length === 0) {
+    return res.status(400).json({ success: false, error: 'no_blocks_selected' });
+  }
+
+  // Every checkout here is a top-up on an existing order: unlock prices apply.
+  const tier = reportBlocks.unlockPriceFor(ids);
+  const stripePriceId = tier && PRICE_MAP[tier.key];
+  if (!stripePriceId) {
+    console.error('[blocks] No Stripe price for tier', tier && tier.key);
+    return res.status(500).json({ success: false, error: 'price_not_configured' });
+  }
+
+  const labels = ids.map(function (id) { return reportBlocks.BLOCKS[id].label; }).join(' · ');
+
+  try {
+    const site = SITE_URL.replace(/\/$/, '');
+    const session = await stripe.checkout.sessions.create({
+      mode: 'payment',
+      line_items: [{ price: stripePriceId, quantity: 1 }],
+      custom_text: {
+        submit: { message: labels + ' — con i passi pratici sempre inclusi.' },
+      },
+      // `selected_price` is deliberately absent: it drives the auto-subscription
+      // rule, and buying a chapter must never start one.
+      metadata: {
+        calculation_id: cid,
+        product:        'report_blocks',
+        blocks:         ids.join(','),
+      },
+      success_url: site + '/result-unlocked.html?cid=' + encodeURIComponent(cid) + '&sbloccati=' + encodeURIComponent(ids.join(',')),
+      cancel_url:  site + '/result-unlocked.html?cid=' + encodeURIComponent(cid),
+    });
+
+    console.log('[blocks] Checkout opened for', cid, '—', ids.join(','), 'at', tier.key);
+    res.json({ success: true, url: session.url });
+
+  } catch (err) {
+    console.error('[blocks] Checkout creation failed:', err.message);
+    res.status(500).json({ success: false, error: 'checkout_failed' });
+  }
+});
+
+// ── GET /api/blocks?cid=… — the catalogue, and what this order already has ────
+app.get('/api/blocks', function (req, res) {
+  const cid = String(req.query.cid || '').trim();
+  let owned = null;
+  if (cid) {
+    try { owned = db.getSessionBlocks(cid); } catch (_) { owned = null; }
+  }
+  res.json({
+    success: true,
+    owned,
+    blocks: reportBlocks.blockList().map(function (b) {
+      return { id: b.id, label: b.label, sub: b.sub, glyph: b.glyph, free: !!b.free, order: b.order };
+    }),
+  });
+});
+
+// =====================================================
+// CHAPTERS — what a price buys, and one-tap top-ups
+// =====================================================
+/*
+   Two things live here.
+
+   1. The first purchase now buys a BUNDLE, not always the whole reading:
+      1,59 € is the core chapter, 3,59 € three chapters, 7,59 € and up
+      everything (see BUNDLES in services/reportBlocks.js). The reading is
+      still generated in full — the chapters the buyer did not take are what
+      the result page sells next.
+
+   2. Those later chapters are bought in ONE TAP. Stripe saved the card at the
+      first purchase (setup_future_usage: off_session), so adding a chapter is
+      an off-session charge on that card: no card form, no redirect. When
+      there is no saved card, or the bank insists on authentication, the page
+      falls back to the existing Stripe Checkout flow.
+
+   Neither path may ever start a subscription: the unlock PaymentIntent
+   carries no `selected_price`, which is the field the auto-subscription
+   rule keys on.
+*/
+
+/**
+ * Records the chapters a first purchase at this price includes. A price with
+ * no bundle — or one we do not recognise — means the whole reading, and a row
+ * that already has a list is a top-up in progress, which must not be narrowed.
+ * @param {string} cid
+ * @param {string|null} priceKey
+ */
+function applyFirstPurchaseBundle(cid, priceKey) {
+  const bundle = reportBlocks.bundleFor(priceKey);
+  if (!bundle) { return; }
+  const row = db.getSession(cid);
+  if (!row || row.blocks_json) { return; }
+  db.setSessionBlocks(cid, bundle);
+  console.log('[blocks] First purchase at', priceKey, 'grants', bundle.join(','), 'for', cid);
+}
+
+/**
+ * Adds chapters to an order. Idempotent: a webhook retry after a direct grant
+ * adds nothing twice, and owning every paid chapter collapses to "all".
+ * @param {string} cid
+ * @param {string[]} ids
+ * @returns {string[]|null} what the order owns now (null = everything)
+ */
+function grantBlocks(cid, ids) {
+  db.addSessionBlocks(cid, ids);
+  const owned = db.getSessionBlocks(cid) || [];
+  const complete = reportBlocks.purchasable()
+    .every(function (b) { return owned.indexOf(b.id) !== -1; });
+  if (complete) { db.clearSessionBlocks(cid); return null; }
+  return owned;
+}
+
+/**
+ * The chapters a request may actually buy: known, paid, not yet owned, each
+ * once. The same rule for both purchase paths.
+ * @returns {{ids: string[], owned: string[]}}
+ */
+function unlockSelection(cid, wanted) {
+  let owned = [];
+  try { owned = db.getSessionBlocks(cid) || []; } catch (_) { owned = []; }
+  const ids = (Array.isArray(wanted) ? wanted : [])
+    .map(function (id) { return String(id || '').trim(); })
+    .filter(function (id, i, arr) {
+      const b = reportBlocks.BLOCKS[id];
+      return b && !b.free && owned.indexOf(id) === -1 && arr.indexOf(id) === i;
+    });
+  return { ids: ids, owned: owned };
+}
+
+// ── POST /api/blocks/unlock { cid, blocks: [...] } ────────────────────────────
+// One-tap purchase on the card saved at the first order. Replies either with
+// the chapters now owned, or with `fallback: 'checkout'` when the page should
+// open Stripe Checkout instead — never with a half-finished charge.
+app.post('/api/blocks/unlock', async function (req, res) {
+  const cid = String((req.body && req.body.cid) || '').trim();
+  if (!cid) { return res.status(400).json({ success: false, error: 'missing_cid' }); }
+
+  const row = db.getSession(cid);
+  if (!row) { return res.status(404).json({ success: false, error: 'session_not_found' }); }
+  if (row.payment_status !== 'paid') {
+    return res.status(403).json({ success: false, error: 'not_paid' });
+  }
+  if (!row.blocks_json) {
+    return res.status(409).json({ success: false, error: 'already_complete' });
+  }
+
+  const sel = unlockSelection(cid, req.body && req.body.blocks);
+  if (sel.ids.length === 0) {
+    return res.status(400).json({ success: false, error: 'no_blocks_selected' });
+  }
+
+  const tier = reportBlocks.unlockPriceFor(sel.ids);
+  if (!tier) { return res.status(400).json({ success: false, error: 'no_blocks_selected' }); }
+
+  const saved = db.getStripeCustomer(cid);
+  if (!saved || !saved.pm) {
+    return res.json({ success: false, fallback: 'checkout', reason: 'no_saved_card' });
+  }
+
+  const labels = sel.ids.map(function (id) { return reportBlocks.BLOCKS[id].label; }).join(' · ');
+
+  try {
+    const intent = await stripe.paymentIntents.create({
+      amount:         Math.round(tier.amount * 100),
+      currency:       'eur',
+      customer:       saved.customer,
+      payment_method: saved.pm,
+      off_session:    true,
+      confirm:        true,
+      description:    'Lignaggio — capitoli: ' + labels,
+      // No `selected_price` on purpose: it drives the auto-subscription rule.
+      metadata: {
+        calculation_id: cid,
+        product:        'report_blocks',
+        blocks:         sel.ids.join(','),
+        unlock_tier:    tier.key,
+      },
+    }, {
+      // The same chapters at the same price from the same order is the same
+      // purchase: a double tap or a retried request must not charge twice.
+      idempotencyKey: 'unlock_' + cid + '_' + sel.ids.slice().sort().join('-') + '_' + tier.key,
+    });
+
+    if (intent.status !== 'succeeded') {
+      // requires_action (bank wants 3-D Secure) or anything else unfinished:
+      // Checkout can handle the authentication; an API charge cannot.
+      console.log('[blocks] Off-session charge not completed for', cid, '—', intent.status);
+      return res.json({ success: false, fallback: 'checkout', reason: intent.status });
+    }
+
+    const owned = grantBlocks(cid, sel.ids);
+    console.log('[blocks] One-tap:', sel.ids.join(','), 'for', cid, 'at', tier.key, '—', intent.id);
+    return res.json({ success: true, blocks: owned, charged: tier.key, paymentIntent: intent.id });
+
+  } catch (err) {
+    // Declines and expired cards are ordinary here: the card was saved months
+    // ago. The page gets a clean fallback, the log gets the reason.
+    console.warn('[blocks] One-tap failed for', cid, '—', err.code || err.type || '', err.message);
+    return res.json({ success: false, fallback: 'checkout', reason: err.code || 'charge_failed' });
+  }
+});
+
+// ── Second abandoned-cart email ───────────────────────────────────────────────
+// The first one goes out an hour after the quiz and only says "your results are
+// waiting". This one goes a day later and says what it costs, because the
+// person who did not click the first time was not short of reminders — they
+// were short of a reason. It quotes their own score back at them.
+const ABANDONED2_AFTER_MS = 24 * 60 * 60 * 1000;
+
+async function sendAbandonedCartEmail2(row) {
+  const cid       = row.calculation_id;
+  const resumeUrl = SITE_URL + '/offer.html?resume=' + encodeURIComponent(cid);
+
+  let score = null;
+  try {
+    const c = row.compatibility_json ? JSON.parse(row.compatibility_json) : null;
+    const raw = c && (c.compatibilityScore || c.score);
+    if (raw) { score = Math.min(93, Math.max(46, parseInt(raw, 10))); }
+  } catch (_) { score = null; }
+
+  const p1 = escapeHtml(row.partner1_name || '');
+  const p2 = escapeHtml(row.partner2_name || '');
+  const couple = p1 && p2 ? p1 + ' e ' + p2 : 'voi due';
+
+  const opening = score
+    ? '<p style="font-size:17px;margin:0 0 14px"><strong>' + score + '%</strong> dice quanto vi attraete. ' +
+      'La lettura dice che cosa vi costa &mdash; e le due cose non vanno quasi mai insieme.</p>'
+    : '<p style="font-size:17px;margin:0 0 14px">Il punteggio dice quanto vi attraete. ' +
+      'La lettura dice che cosa vi costa &mdash; e le due cose non vanno quasi mai insieme.</p>';
+
+  const html = `
+    <div style="font-family:sans-serif;max-width:600px;margin:auto;color:#222;line-height:1.6">
+      <div style="background:#6b21a8;padding:24px 32px;border-radius:8px 8px 0 0">
+        <h1 style="color:#fff;font-size:20px;margin:0">✦ Quello che il numero non dice</h1>
+      </div>
+      <div style="background:#fff;padding:32px;border:1px solid #e5e7eb;border-top:0;border-radius:0 0 8px 8px">
+        ${opening}
+        <p>La lettura di <strong>${couple}</strong> &egrave; ancora l&igrave;, scritta sulle vostre risposte:
+        perch&eacute; vi siete incontrati, chi dei due si allontana per primo, e i passi concreti per
+        attraversare questo momento insieme &mdash; con dieci esercizi da fare stasera, non fra sei mesi.</p>
+        <p style="margin:18px 0 6px"><strong>Parte da 1,59 &euro;.</strong> Il link resta valido: la lettura non scade.</p>
+        <p style="text-align:center;margin:26px 0">
+          <a href="${resumeUrl}" style="background:#6b21a8;color:#fff;padding:14px 32px;border-radius:6px;text-decoration:none;font-weight:600;font-size:16px">
+            Apri la lettura →
+          </a>
+        </p>
+        <p style="font-size:12px;color:#666">Soddisfatti o rimborsati: se non vi riconoscete, scrivete a
+        ${escapeHtml(process.env.SMTP_USER || 'support@lignaggio.it')} e rimborsiamo senza domande.</p>
+        <p style="margin-top:28px;font-size:12px;color:#999;text-align:center">
+          &copy; Quiz Test di Compatibilit&agrave; dei Partner &middot; lignaggio.it
+        </p>
+      </div>
+    </div>`;
+
+  await sendEmail({
+    to:      row.email,
+    subject: score ? score + '% — e quello che il numero non dice' : 'Quello che il numero non dice',
+    html,
+  });
+  db.markAbandoned2Sent(cid);
+  console.log('[abandoned-cart] Second email sent for', cid);
+}
+
+async function checkAbandonedSessions2() {
+  if (!process.env.SMTP_USER || !process.env.SMTP_PASS) { return; }
+  let candidates;
+  try { candidates = db.getAbandoned2Candidates(ABANDONED2_AFTER_MS); }
+  catch (err) { console.error('[abandoned-cart] second-email query error:', err.message); return; }
+
+  for (const row of candidates) {
+    try {
+      await sendAbandonedCartEmail2(row);
+    } catch (err) {
+      console.error('[abandoned-cart] Second email error for', row.email, err.message);
+      if (isPermanentSmtpFailure(err)) {
+        try { db.markAbandoned2Sent(row.calculation_id); } catch (_) {}
+      }
+    }
+  }
+}
+
+setInterval(checkAbandonedSessions2, 5 * 60 * 1000);
+
 // Public endpoint: return bonus code for a calculation_id (no auth)
 app.get('/api/bonus-code', function (req, res) {
   const cid = String(req.query.cid || '').trim();
@@ -3244,7 +4110,7 @@ app.post('/api/admin/send-email', adminAuth, async function (req, res) {
           <p style="margin:12px 0 0;font-size:11px;color:#888">Codice personale &middot; Valido fino al 31 maggio</p>
         </div>` : '';
       const resultUrl = SITE_URL + '/quiz-test/result-unlocked.html?cid=' + encodeURIComponent(calculation_id);
-      const bodyHtml  = _buildConsultBody(consultation, p1Name, p2Name);
+      const bodyHtml  = _buildConsultBody(gateForEmail(consultation, calculation_id), p1Name, p2Name);
       await sendEmail({
         to:      emailRow.email,
         subject: 'Quiz Test di Compatibilità dei Partner – La tua consulenza è pronta',
@@ -3329,7 +4195,7 @@ app.post('/api/admin/send-consultation', adminAuth, async function (req, res) {
     const p2Name   = row.partner2_name || 'Partner 2';
     const score    = compat.compatibilityScore != null ? compat.compatibilityScore + '%' : null;
     const resultUrl = SITE_URL + '/quiz-test/result-unlocked.html?cid=' + encodeURIComponent(calculation_id);
-    const bodyHtml  = _buildConsultBody(consultation, p1Name, p2Name);
+    const bodyHtml  = _buildConsultBody(gateForEmail(consultation, calculation_id), p1Name, p2Name);
     await sendEmail({
       to:      emailRow.email,
       subject: 'Quiz Test di Compatibilità dei Partner – La tua consulenza è pronta',
