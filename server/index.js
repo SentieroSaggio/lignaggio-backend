@@ -1931,6 +1931,41 @@ app.post('/api/confirm-payment', async (req, res) => {
   }
 });
 
+// =====================================================
+// GET /api/payment-status/:pi — is this payment settled, and for what?
+//
+// The lineage and strega quizzes hand their PDF out from a PHP page on the
+// IONOS webspace, which has no Stripe key of its own (and must never get one:
+// a .env with the live key was found publicly downloadable there in Nov 2026).
+// That page asks here instead. The answer is deliberately small — paid or not,
+// which archetype and which price — and never includes the customer's e-mail.
+// A PaymentIntent id is 24+ random characters, so it is not guessable.
+// =====================================================
+app.get('/api/payment-status/:pi', async (req, res) => {
+  const piId = String(req.params.pi || '').trim();
+  if (!/^pi_[A-Za-z0-9_]{6,}$/.test(piId)) {
+    return res.status(400).json({ success: false, error: 'invalid_payment_intent_id' });
+  }
+  try {
+    const pi = await stripe.paymentIntents.retrieve(piId);
+    const md = pi.metadata || {};
+    res.set('Cache-Control', 'no-store');
+    return res.json({
+      success: true,
+      paid:    pi.status === 'succeeded',
+      status:  pi.status,
+      arch:    String(md.arch || md.archetype || ''),
+      price:   String(md.selected_price || ''),
+    });
+  } catch (err) {
+    if (err && err.statusCode === 404) {
+      return res.status(404).json({ success: false, error: 'not_found' });
+    }
+    console.error('[payment-status] Stripe lookup failed for', piId, '—', err.message);
+    return res.status(502).json({ success: false, error: 'stripe_lookup_failed' });
+  }
+});
+
 // ── POST /api/generate-preview ──────────────────────────────────────────────────
 // Called during the analysis phase, BEFORE payment.
 // Creates the stored entry and generates a short 4-section teaser preview.
