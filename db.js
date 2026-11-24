@@ -244,6 +244,19 @@ db.exec(`
     created_at INTEGER
   );
 
+  -- Who the lineage and strega quizzes know by e-mail. Those funnels keep the
+  -- birth date in the browser, so until this table existed a Plus subscriber
+  -- who came from them had no birth date on file and the monthly reading was
+  -- skipped. One row per address, newest data wins, empty values never
+  -- overwrite a value we already have.
+  CREATE TABLE IF NOT EXISTS quiz_profiles (
+    email      TEXT PRIMARY KEY,          -- lower-cased, trimmed
+    name       TEXT,
+    birth_date TEXT,                      -- 'YYYY-MM-DD'
+    quiz       TEXT,                      -- 'lin' | 'str' | …
+    updated_at INTEGER
+  );
+
   -- The day-before-billing notice for Lignaggio Plus. One row per
   -- subscription: claiming the row is what guarantees a single email, however
   -- many times the hourly sweep sees the same trial.
@@ -489,6 +502,41 @@ const stmtMonthlyStats = db.prepare(`
   SELECT status, COUNT(*) AS n FROM monthly_forecast WHERE period = ? GROUP BY status
 `);
 
+const stmtMonthlyRows = db.prepare(`
+  SELECT subscription_id, period, email, name, birth_date, status, attempts, last_error, sent_at, created_at
+    FROM monthly_forecast
+   WHERE period = ?
+   ORDER BY created_at ASC
+`);
+
+const stmtMonthlyPeriods = db.prepare(`
+  SELECT period,
+         SUM(CASE WHEN status = 'sent'    THEN 1 ELSE 0 END) AS sent,
+         SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending,
+         SUM(CASE WHEN status = 'failed'  THEN 1 ELSE 0 END) AS failed,
+         SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END) AS skipped,
+         COUNT(*) AS total
+    FROM monthly_forecast
+   GROUP BY period
+   ORDER BY period DESC
+   LIMIT 24
+`);
+
+// ── Quiz profiles (lineage / strega) ─────────────────────────────────────────
+const stmtSaveQuizProfile = db.prepare(`
+  INSERT INTO quiz_profiles (email, name, birth_date, quiz, updated_at)
+  VALUES (@email, @name, @birth_date, @quiz, @updated_at)
+  ON CONFLICT(email) DO UPDATE SET
+    name       = COALESCE(NULLIF(excluded.name, ''), quiz_profiles.name),
+    birth_date = COALESCE(NULLIF(excluded.birth_date, ''), quiz_profiles.birth_date),
+    quiz       = COALESCE(NULLIF(excluded.quiz, ''), quiz_profiles.quiz),
+    updated_at = excluded.updated_at
+`);
+
+const stmtGetQuizProfile = db.prepare(`
+  SELECT email, name, birth_date, quiz, updated_at FROM quiz_profiles WHERE email = ?
+`);
+
 const stmtClaimTrialReminder = db.prepare(`
   INSERT OR IGNORE INTO trial_reminders (subscription_id, email, trial_end, created_at)
   VALUES (@subscription_id, @email, @trial_end, @created_at)
@@ -612,8 +660,51 @@ function optOutMonthly(email) {
   stmtOptOut.run(String(email || '').trim().toLowerCase(), Date.now());
 }
 
+/**
+ * The birth date behind an e-mail address: the couple quiz first (partner 1),
+ * then whatever the lineage / strega quizzes told us. Shape: {name, birth_date}.
+ */
 function findBirthDateByEmail(email) {
-  return stmtBirthByEmail.get(String(email || '').trim()) || null;
+  const raw = String(email || '').trim();
+  const fromCouple = stmtBirthByEmail.get(raw) || null;
+  // A couple-quiz row with a date the forecast cannot read must not hide a
+  // good date from the other quizzes (same two shapes monthlyForecast accepts).
+  const readable = /^(\d{4}-\d{1,2}-\d{1,2}|\d{1,2}[./-]\d{1,2}[./-]\d{4})$/;
+  if (fromCouple && readable.test(String(fromCouple.birth_date || '').trim())) { return fromCouple; }
+  const profile = stmtGetQuizProfile.get(raw.toLowerCase());
+  if (!profile || !profile.birth_date) { return null; }
+  return { name: profile.name || '', birth_date: profile.birth_date };
+}
+
+/**
+ * Remembers who a quiz visitor is. Empty fields never erase stored ones.
+ * @param {{email: string, name?: string, birthDate?: string, quiz?: string}} p
+ */
+function saveQuizProfile(p) {
+  const email = String((p && p.email) || '').trim().toLowerCase();
+  if (!email) { return false; }
+  stmtSaveQuizProfile.run({
+    email:      email,
+    name:       String((p && p.name) || '').trim().slice(0, 80),
+    birth_date: String((p && p.birthDate) || '').trim().slice(0, 10),
+    quiz:       String((p && p.quiz) || '').trim().slice(0, 20),
+    updated_at: Date.now(),
+  });
+  return true;
+}
+
+function getQuizProfile(email) {
+  return stmtGetQuizProfile.get(String(email || '').trim().toLowerCase()) || null;
+}
+
+/** Every row of one month, without the forecast text (for the admin panel). */
+function getMonthlyForecastRows(period) {
+  return stmtMonthlyRows.all(period);
+}
+
+/** Per-month totals, newest first (for the admin panel). */
+function getMonthlyPeriods() {
+  return stmtMonthlyPeriods.all();
 }
 
 // ── Analisi Focus statements ─────────────────────────────────────────────────
@@ -1836,6 +1927,10 @@ module.exports = {
   markMonthlyForecastSkipped,
   getMonthlyForecast,
   getMonthlyForecastStats,
+  getMonthlyForecastRows,
+  getMonthlyPeriods,
+  saveQuizProfile,
+  getQuizProfile,
   isMonthlyOptedOut,
   optOutMonthly,
   findBirthDateByEmail,

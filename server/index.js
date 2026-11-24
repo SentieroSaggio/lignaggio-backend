@@ -650,6 +650,7 @@ app.post('/create-payment-intent', async (req, res) => {
     if (!email) {
       return res.status(400).json({ error: 'Missing email' });
     }
+    rememberQuizProfile(req.body);
 
     const archetypeValue = arch ?? archetype ?? '';
 
@@ -1838,6 +1839,34 @@ function validatePartner(partner, label) {
 // later from the payment intent) never resets thank_you_sent / abandoned_sent.
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
+/**
+ * The lineage and strega quizzes send name, birth date and quiz id along with
+ * the e-mail (analysis page and checkout). Stored by e-mail so the monthly
+ * Lignaggio Plus reading can find the birth date of a subscriber who never did
+ * the couple quiz. A bad or missing date is simply not stored; the caller's
+ * response is never affected.
+ * @returns {boolean} whether a profile row was written
+ */
+function rememberQuizProfile(body) {
+  const b = body || {};
+  const email = String(b.email || '').trim();
+  if (!email || !EMAIL_RE.test(email)) { return false; }
+  const parsed = require('../services/monthlyForecast').parseBirthDate(b.birth_date);
+  const name = String(b.name || '').trim().slice(0, 80);
+  if (!parsed && !name) { return false; }
+  const iso = parsed
+    ? parsed.year + '-' + String(parsed.month).padStart(2, '0') + '-' + String(parsed.day).padStart(2, '0')
+    : '';
+  try {
+    db.saveQuizProfile({ email, name, birthDate: iso, quiz: String(b.quiz || '').trim().slice(0, 20) });
+    if (iso) { console.log('[profile] Birth date stored for', email, '(' + (b.quiz || '?') + ')'); }
+    return true;
+  } catch (err) {
+    console.error('[profile] could not store', err.message);
+    return false;
+  }
+}
+
 app.post('/api/save-email', (req, res) => {
   const { calculation_id, email } = req.body || {};
 
@@ -1852,6 +1881,7 @@ app.post('/api/save-email', (req, res) => {
   try {
     db.saveSessionEmail(String(calculation_id).trim(), address);
     console.log('[save-email] Stored for calculation_id:', calculation_id);
+    rememberQuizProfile(req.body);
     return res.json({ success: true });
   } catch (err) {
     console.error('[save-email] DB error:', err.message);
@@ -2496,14 +2526,17 @@ function _createTransporter() {
   });
 }
 
-async function sendEmail({ to, subject, html, attachments }) {
+const DEFAULT_FROM_NAME = 'Quiz Test di Compatibilità dei Partner';
+const PLUS_FROM_NAME    = 'Lignaggio Plus';
+
+async function sendEmail({ to, subject, html, attachments, fromName }) {
   if (!process.env.SMTP_USER || !process.env.SMTP_PASS) {
     console.warn('[email] SMTP_USER/SMTP_PASS not configured — email not sent to', to);
     return;
   }
   const transporter = _createTransporter();
   const mailOptions = {
-    from:    '"Quiz Test di Compatibilità dei Partner" <' + process.env.SMTP_USER + '>',
+    from:    '"' + String(fromName || DEFAULT_FROM_NAME).replace(/"/g, '') + '" <' + process.env.SMTP_USER + '>',
     to,
     subject,
     html,
@@ -3042,8 +3075,9 @@ async function sweepMonthlyForecast() {
         '&t=' + monthlyUnsubToken(row.email);
 
       await sendEmail({
-        to:      row.email,
-        subject: 'La tua lettura di ' + anchors.meseNome + ' ' + anchors.year + ' ✦ Lignaggio Plus',
+        to:       row.email,
+        fromName: PLUS_FROM_NAME,
+        subject:  'La tua lettura di ' + anchors.meseNome + ' ' + anchors.year + ' ✦ Lignaggio Plus',
         html:    renderMonthlyEmail({
           forecast: forecast, anchors: anchors, name: row.name, stopUrl: stopUrl,
         }),
@@ -3115,7 +3149,7 @@ async function sweepTrialReminders() {
         support:     process.env.SMTP_USER || 'support@lignaggio.it',
         amountEur:   19,
       });
-      await sendEmail({ to: t.email, subject: mail.subject, html: mail.html });
+      await sendEmail({ to: t.email, fromName: PLUS_FROM_NAME, subject: mail.subject, html: mail.html });
       db.markTrialReminderSent(t.id);
       console.log('[plus] Trial reminder sent to', t.email, 'for', t.id, '— ends', new Date(t.trialEnd * 1000).toISOString());
     } catch (err) {
@@ -4325,6 +4359,26 @@ app.post('/api/admin/sessions/delete', adminAuth, function (req, res) {
 });
 
 // ── Analytics stats routes ─────────────────────────────────────────────────
+// GET /api/admin/monthly?period=YYYY-MM — what the Lignaggio Plus reading did:
+// per-month totals and every row of one month (no forecast text, no secrets).
+app.get('/api/admin/monthly', adminAuth, function (req, res) {
+  try {
+    const wanted = String(req.query.period || '');
+    const period = /^\d{4}-\d{2}$/.test(wanted) ? wanted : romeToday().period;
+    res.json({
+      period:  period,
+      stats:   db.getMonthlyForecastStats(period),
+      rows:    db.getMonthlyForecastRows(period),
+      periods: db.getMonthlyPeriods(),
+      enrolDays: MONTHLY_ENROL_DAYS,
+      sweepMinutes: Math.round(MONTHLY_SWEEP_MS / 60000),
+    });
+  } catch (err) {
+    console.error('[admin/monthly]', err.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
 app.get('/api/admin/stats/overview', adminAuth, function (req, res) {
   try {
     const data = db.getStatsOverview();
