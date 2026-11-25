@@ -257,6 +257,35 @@ db.exec(`
     updated_at INTEGER
   );
 
+  -- Lineage / strega leads: an e-mail with an archetype and no payment yet.
+  -- Feeds the two reminder e-mails (1 h, 24 h). One row per quiz session;
+  -- the sweep looks at the newest row per (email, quiz) and stops for good
+  -- once any row of that pair is paid.
+  CREATE TABLE IF NOT EXISTS quiz_leads (
+    calculation_id TEXT PRIMARY KEY,
+    quiz           TEXT NOT NULL,
+    email          TEXT NOT NULL,          -- lower-cased, trimmed
+    name           TEXT,
+    arch           INTEGER,
+    arch_name      TEXT,
+    created_at     INTEGER NOT NULL,
+    paid_at        INTEGER,
+    reminder1_at   INTEGER,
+    reminder2_at   INTEGER,
+    last_error     TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_quiz_leads_pair ON quiz_leads (email, quiz);
+
+  -- One notice per failed renewal invoice of Lignaggio Plus. The claim is the
+  -- primary key, so an hourly sweep can never send the same notice twice.
+  CREATE TABLE IF NOT EXISTS dunning_notices (
+    invoice_id      TEXT PRIMARY KEY,
+    subscription_id TEXT NOT NULL,
+    email           TEXT NOT NULL,
+    created_at      INTEGER,
+    sent_at         INTEGER
+  );
+
   -- The day-before-billing notice for Lignaggio Plus. One row per
   -- subscription: claiming the row is what guarantees a single email, however
   -- many times the hourly sweep sees the same trial.
@@ -537,6 +566,74 @@ const stmtGetQuizProfile = db.prepare(`
   SELECT email, name, birth_date, quiz, updated_at FROM quiz_profiles WHERE email = ?
 `);
 
+// ── Quiz leads (lineage / strega reminders) ──────────────────────────────────
+const stmtSaveQuizLead = db.prepare(`
+  INSERT INTO quiz_leads (calculation_id, quiz, email, name, arch, arch_name, created_at)
+  VALUES (@calculation_id, @quiz, @email, @name, @arch, @arch_name, @created_at)
+  ON CONFLICT(calculation_id) DO UPDATE SET
+    email     = excluded.email,
+    name      = COALESCE(NULLIF(excluded.name, ''), quiz_leads.name),
+    arch      = COALESCE(excluded.arch, quiz_leads.arch),
+    arch_name = COALESCE(NULLIF(excluded.arch_name, ''), quiz_leads.arch_name)
+`);
+
+/* Newest unpaid lead per (email, quiz), old enough, never reminded, and no
+   reminder to that pair in the last week (a retake does not restart the nagging). */
+const stmtQuizLeadsDue1 = db.prepare(`
+  SELECT l.* FROM quiz_leads l
+   WHERE l.paid_at IS NULL AND l.reminder1_at IS NULL AND l.arch IS NOT NULL
+     AND l.created_at <= @cutoff
+     AND l.calculation_id = (SELECT x.calculation_id FROM quiz_leads x WHERE x.email = l.email AND x.quiz = l.quiz ORDER BY x.created_at DESC, x.rowid DESC LIMIT 1)
+     AND NOT EXISTS (SELECT 1 FROM quiz_leads p WHERE p.email = l.email AND p.quiz = l.quiz AND p.paid_at IS NOT NULL)
+     AND NOT EXISTS (SELECT 1 FROM quiz_leads r WHERE r.email = l.email AND r.quiz = l.quiz AND r.reminder1_at IS NOT NULL AND r.reminder1_at > @recent)
+   ORDER BY l.created_at ASC
+   LIMIT 40
+`);
+
+const stmtQuizLeadsDue2 = db.prepare(`
+  SELECT l.* FROM quiz_leads l
+   WHERE l.paid_at IS NULL AND l.reminder1_at IS NOT NULL AND l.reminder2_at IS NULL
+     AND l.created_at <= @cutoff
+     AND l.reminder1_at <= @r1cutoff
+     AND NOT EXISTS (SELECT 1 FROM quiz_leads p WHERE p.email = l.email AND p.quiz = l.quiz AND p.paid_at IS NOT NULL)
+   ORDER BY l.created_at ASC
+   LIMIT 40
+`);
+
+const stmtQuizLeadReminded1 = db.prepare(`
+  UPDATE quiz_leads SET reminder1_at = @now, last_error = @error WHERE calculation_id = @calculation_id
+`);
+const stmtQuizLeadReminded2 = db.prepare(`
+  UPDATE quiz_leads SET reminder2_at = @now, last_error = @error WHERE calculation_id = @calculation_id
+`);
+const stmtQuizLeadsPaid = db.prepare(`
+  UPDATE quiz_leads SET paid_at = @now
+   WHERE email = @email AND (@quiz = '' OR quiz = @quiz) AND paid_at IS NULL
+`);
+const stmtQuizLeadStats = db.prepare(`
+  SELECT quiz,
+         COUNT(*) AS leads,
+         SUM(CASE WHEN reminder1_at IS NOT NULL THEN 1 ELSE 0 END) AS reminded1,
+         SUM(CASE WHEN reminder2_at IS NOT NULL THEN 1 ELSE 0 END) AS reminded2,
+         SUM(CASE WHEN paid_at IS NOT NULL THEN 1 ELSE 0 END) AS paid,
+         SUM(CASE WHEN paid_at IS NOT NULL AND reminder1_at IS NOT NULL AND paid_at > reminder1_at THEN 1 ELSE 0 END) AS paid_after_reminder
+    FROM quiz_leads
+   GROUP BY quiz
+`);
+const stmtRecentQuizLeads = db.prepare(`
+  SELECT calculation_id, quiz, email, name, arch, arch_name, created_at, paid_at, reminder1_at, reminder2_at, last_error
+    FROM quiz_leads ORDER BY created_at DESC LIMIT 60
+`);
+
+// ── Lignaggio Plus dunning ledger ────────────────────────────────────────────
+const stmtClaimDunning = db.prepare(`
+  INSERT OR IGNORE INTO dunning_notices (invoice_id, subscription_id, email, created_at)
+  VALUES (@invoice_id, @subscription_id, @email, @created_at)
+`);
+const stmtDunningSent = db.prepare(`UPDATE dunning_notices SET sent_at = @sent_at WHERE invoice_id = @invoice_id`);
+const stmtReleaseDunning = db.prepare(`DELETE FROM dunning_notices WHERE invoice_id = ? AND sent_at IS NULL`);
+const stmtGetDunning = db.prepare(`SELECT * FROM dunning_notices WHERE invoice_id = ?`);
+
 const stmtClaimTrialReminder = db.prepare(`
   INSERT OR IGNORE INTO trial_reminders (subscription_id, email, trial_end, created_at)
   VALUES (@subscription_id, @email, @trial_end, @created_at)
@@ -697,6 +794,77 @@ function getQuizProfile(email) {
   return stmtGetQuizProfile.get(String(email || '').trim().toLowerCase()) || null;
 }
 
+/**
+ * Remembers a lead of the lineage / strega quizzes. Empty name/archetype
+ * never erase what an earlier call stored.
+ * @param {{calculationId: string, quiz: string, email: string, name?: string, arch?: number, archName?: string}} p
+ */
+function saveQuizLead(p) {
+  const cid = String((p && p.calculationId) || '').trim();
+  const email = String((p && p.email) || '').trim().toLowerCase();
+  const quiz = String((p && p.quiz) || '').trim();
+  if (!cid || !email || !quiz) { return false; }
+  const arch = parseInt(p.arch, 10);
+  stmtSaveQuizLead.run({
+    calculation_id: cid,
+    quiz:           quiz,
+    email:          email,
+    name:           String((p && p.name) || '').trim().slice(0, 80),
+    arch:           arch >= 1 && arch <= 9 ? arch : null,
+    arch_name:      String((p && p.archName) || '').trim().slice(0, 120),
+    created_at:     Date.now(),
+  });
+  return true;
+}
+
+function getQuizLead(calculationId) {
+  return db.prepare('SELECT * FROM quiz_leads WHERE calculation_id = ?').get(String(calculationId || '')) || null;
+}
+
+/** Leads due for reminder n (1 or 2), at least minAgeMs old. */
+function getQuizLeadsDue(n, minAgeMs) {
+  const cutoff = Date.now() - minAgeMs;
+  if (n === 1) { return stmtQuizLeadsDue1.all({ cutoff: cutoff, recent: Date.now() - 7 * 24 * 60 * 60 * 1000 }); }
+  // The second note says "ieri": it waits for the first one to be a day old too.
+  return stmtQuizLeadsDue2.all({ cutoff: cutoff, r1cutoff: Date.now() - Math.min(minAgeMs, 23 * 60 * 60 * 1000) });
+}
+
+function markQuizLeadReminded(calculationId, n, error) {
+  const stmt = n === 1 ? stmtQuizLeadReminded1 : stmtQuizLeadReminded2;
+  stmt.run({ calculation_id: String(calculationId || ''), now: Date.now(), error: error || null });
+}
+
+/** A paid e-mail gets no more reminders; quiz '' means every quiz of that address. */
+function markQuizLeadsPaid(email, quiz) {
+  const info = stmtQuizLeadsPaid.run({ email: String(email || '').trim().toLowerCase(), quiz: String(quiz || ''), now: Date.now() });
+  return info.changes;
+}
+
+function getQuizLeadStats() {
+  return stmtQuizLeadStats.all();
+}
+
+function getRecentQuizLeads() {
+  return stmtRecentQuizLeads.all();
+}
+
+function claimDunningNotice(invoiceId, subscriptionId, email) {
+  const info = stmtClaimDunning.run({ invoice_id: invoiceId, subscription_id: subscriptionId, email: String(email || '').trim(), created_at: Date.now() });
+  return info.changes === 1;
+}
+
+function markDunningSent(invoiceId) {
+  stmtDunningSent.run({ invoice_id: invoiceId, sent_at: Date.now() });
+}
+
+function releaseDunningNotice(invoiceId) {
+  stmtReleaseDunning.run(invoiceId);
+}
+
+function getDunningNotice(invoiceId) {
+  return stmtGetDunning.get(invoiceId) || null;
+}
+
 /** Every row of one month, without the forecast text (for the admin panel). */
 function getMonthlyForecastRows(period) {
   return stmtMonthlyRows.all(period);
@@ -823,7 +991,7 @@ const stmtGetBonusCode = db.prepare(`
 const stmtGetAbandonedCandidates = db.prepare(`
   SELECT se.calculation_id, se.email, s.partner1_name, s.partner2_name
   FROM session_emails se
-  LEFT JOIN sessions s ON s.id = se.calculation_id
+  JOIN sessions s ON s.id = se.calculation_id
   WHERE se.abandoned_sent = 0
     AND (s.payment_status IS NULL OR s.payment_status != 'paid')
     AND se.created_at < @cutoff
@@ -834,7 +1002,7 @@ const stmtGetAbandonedCandidates = db.prepare(`
 const stmtGetAbandoned2Candidates = db.prepare(`
   SELECT se.calculation_id, se.email, s.partner1_name, s.partner2_name, s.compatibility_json
   FROM session_emails se
-  LEFT JOIN sessions s ON s.id = se.calculation_id
+  JOIN sessions s ON s.id = se.calculation_id
   WHERE se.abandoned_sent = 1
     AND COALESCE(se.abandoned2_sent, 0) = 0
     AND (s.payment_status IS NULL OR s.payment_status != 'paid')
@@ -1931,6 +2099,17 @@ module.exports = {
   getMonthlyPeriods,
   saveQuizProfile,
   getQuizProfile,
+  saveQuizLead,
+  getQuizLead,
+  getQuizLeadsDue,
+  markQuizLeadReminded,
+  markQuizLeadsPaid,
+  getQuizLeadStats,
+  getRecentQuizLeads,
+  claimDunningNotice,
+  markDunningSent,
+  releaseDunningNotice,
+  getDunningNotice,
   isMonthlyOptedOut,
   optOutMonthly,
   findBirthDateByEmail,

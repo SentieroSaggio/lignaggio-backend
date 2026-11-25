@@ -293,6 +293,7 @@ app.post(
         // answer Stripe quickly, and a tracking failure must never delay or
         // affect delivery of the paid product.
         dispatchKeitaroSale(paymentIntent);
+        settleQuizLead(paymentIntent);
 
         // ── New compatibility quiz: mark result as paid, persist to DB ──────────
         const calculationId = metadata.calculation_id;
@@ -724,6 +725,8 @@ app.post('/create-payment-intent', async (req, res) => {
         compatibility_score: compatibility_score != null ? String(compatibility_score) : '',
         // Ad attribution — read back by the webhook to report the sale
         keitaro_subid:       attributionSubid,
+        // Which quiz sold it ('lin' / 'str'; '' for the couple quiz)
+        quiz:                require('../services/quizReminders').known(req.body && req.body.quiz) ? String(req.body.quiz) : '',
       },
     });
 
@@ -1867,6 +1870,32 @@ function rememberQuizProfile(body) {
   }
 }
 
+/**
+ * A lineage / strega visitor who left an e-mail and has an archetype is a
+ * lead: the two reminder e-mails start from here. Couple-quiz calls (no
+ * known quiz id) are ignored; they have their own sequence.
+ */
+function rememberQuizLead(body) {
+  const b = body || {};
+  const quizReminders = require('../services/quizReminders');
+  if (!quizReminders.known(b.quiz)) { return false; }
+  const email = String(b.email || '').trim();
+  if (!email || !EMAIL_RE.test(email) || !b.calculation_id) { return false; }
+  try {
+    return db.saveQuizLead({
+      calculationId: String(b.calculation_id).trim(),
+      quiz:          String(b.quiz),
+      email:         email,
+      name:          String(b.name || ''),
+      arch:          b.arch,
+      archName:      String(b.arch_name || ''),
+    });
+  } catch (err) {
+    console.error('[leads] could not store', err.message);
+    return false;
+  }
+}
+
 app.post('/api/save-email', (req, res) => {
   const { calculation_id, email } = req.body || {};
 
@@ -1882,6 +1911,7 @@ app.post('/api/save-email', (req, res) => {
     db.saveSessionEmail(String(calculation_id).trim(), address);
     console.log('[save-email] Stored for calculation_id:', calculation_id);
     rememberQuizProfile(req.body);
+    rememberQuizLead(req.body);
     return res.json({ success: true });
   } catch (err) {
     console.error('[save-email] DB error:', err.message);
@@ -1979,6 +2009,7 @@ app.get('/api/payment-status/:pi', async (req, res) => {
   try {
     const pi = await stripe.paymentIntents.retrieve(piId);
     const md = pi.metadata || {};
+    if (pi.status === 'succeeded') { settleQuizLead(pi); }
     res.set('Cache-Control', 'no-store');
     return res.json({
       success: true,
@@ -3161,6 +3192,246 @@ async function sweepTrialReminders() {
 }
 
 setInterval(sweepTrialReminders, TRIAL_REMINDER_SWEEP_MS);
+
+// =====================================================
+// LINEAGE / STREGA — reminders, failed renewals, the second guide
+// =====================================================
+const quizReminders = require('../services/quizReminders');
+const plusDunning   = require('../services/plusDunning');
+
+const QUIZ_REMINDER1_MS      = 60 * 60 * 1000;         // an hour after the e-mail
+const QUIZ_REMINDER2_MS      = 24 * 60 * 60 * 1000;    // a day after it
+const QUIZ_REMINDER_SWEEP_MS = 10 * 60 * 1000;
+const DUNNING_SWEEP_MS       = 60 * 60 * 1000;
+const DUNNING_MAX_AGE_SEC    = 60 * 24 * 60 * 60;      // ignore invoices older than 60 days
+const SECOND_GUIDE_AMOUNT    = 299;                    // cents: the 2,99 € price that already exists
+const SECOND_GUIDE_ENABLED   = process.env.SECOND_GUIDE_ENABLED !== 'false';
+const SECOND_GUIDE_RELATIONS = ['figlio', 'figlia', 'madre', 'padre', 'partner', 'sorella', 'fratello', 'amica', 'amico', 'altro'];
+const SECOND_GUIDE_MAX_PER_ORDER = 3;              // guides one first purchase may add
+const SECOND_GUIDE_RATE_WINDOW_MS = 10 * 60 * 1000;
+const SECOND_GUIDE_RATE_MAX = 6;                   // attempts per parent per window
+const _secondGuideHits = new Map();                // parent pi → [timestamps]
+
+function secondGuideRateLimited(piId) {
+  const now = Date.now();
+  const hits = (_secondGuideHits.get(piId) || []).filter(function (t) { return now - t < SECOND_GUIDE_RATE_WINDOW_MS; });
+  hits.push(now);
+  _secondGuideHits.set(piId, hits);
+  if (_secondGuideHits.size > 5000) { _secondGuideHits.clear(); }
+  return hits.length > SECOND_GUIDE_RATE_MAX;
+}
+
+/** How many second guides this order already paid for (any archetype). */
+async function countSecondGuides(customerId, parentId) {
+  let n = 0;
+  const page = await stripe.paymentIntents.list({ customer: customerId, limit: 100 });
+  for (const p of page.data) {
+    if (p.status === 'succeeded' && p.metadata && p.metadata.product === 'second_guide' && p.metadata.parent_pi === parentId) { n++; }
+  }
+  return n;
+}
+const FIRST_PURCHASE_KEYS    = new Set(['5', '9', '13', '17.67', '1.59', '3.59', '7.59']);
+
+/** A paid lineage/strega PaymentIntent ends the reminders for that address. */
+function settleQuizLead(pi) {
+  const md = (pi && pi.metadata) || {};
+  if (md.calculation_id) { return; }                       // couple quiz
+  const email = md.email || pi.receipt_email || '';
+  if (!email) { return; }
+  try {
+    const n = db.markQuizLeadsPaid(email, quizReminders.quizOf(md));
+    if (n) { console.log('[leads] Paid, reminders stopped for', email, '(' + n + ' lead' + (n > 1 ? 's' : '') + ')'); }
+  } catch (err) {
+    console.error('[leads] could not settle', err.message);
+  }
+}
+
+async function sendQuizReminder(lead, n) {
+  const support = process.env.SMTP_USER || 'support@lignaggio.it';
+  const mail = n === 1 ? quizReminders.renderReminder1(lead, support) : quizReminders.renderReminder2(lead, support);
+  try {
+    await sendEmail({ to: lead.email, fromName: mail.fromName, subject: mail.subject, html: mail.html });
+    db.markQuizLeadReminded(lead.calculation_id, n, null);
+    console.log('[leads] Reminder', n, 'sent to', lead.email, '(' + lead.quiz + ', arch ' + lead.arch + ')');
+  } catch (err) {
+    console.error('[leads] Reminder', n, 'failed for', lead.email, '—', err.message);
+    // An undeliverable address is marked so it is never retried; a hiccup gets the next sweep.
+    if (isPermanentSmtpFailure(err)) { db.markQuizLeadReminded(lead.calculation_id, n, 'permanent: ' + err.message); }
+  }
+}
+
+let _leadsSweeping = false;
+async function sweepQuizLeads() {
+  if (!process.env.SMTP_USER || !process.env.SMTP_PASS) { return; }
+  if (_leadsSweeping) { return; }                 // a slow SMTP round must not overlap the next sweep
+  _leadsSweeping = true;
+  try {
+    let due1 = [], due2 = [];
+    try { due1 = db.getQuizLeadsDue(1, QUIZ_REMINDER1_MS); due2 = db.getQuizLeadsDue(2, QUIZ_REMINDER2_MS); }
+    catch (err) { console.error('[leads] could not read the queue:', err.message); return; }
+    for (const lead of due1) { await sendQuizReminder(lead, 1); }
+    for (const lead of due2) { await sendQuizReminder(lead, 2); }
+  } finally {
+    _leadsSweeping = false;
+  }
+}
+
+setInterval(sweepQuizLeads, QUIZ_REMINDER_SWEEP_MS);
+
+/**
+ * Subscriptions whose renewal failed, with the open invoice Stripe keeps
+ * retrying. Only recent invoices: nobody is written to about a charge that
+ * failed two months ago.
+ */
+async function listPastDueRenewals() {
+  if (!SUBSCRIPTION_PRICE_ID) { return []; }
+  const out = [];
+  const since = Math.floor(Date.now() / 1000) - DUNNING_MAX_AGE_SEC;
+  let startingAfter;
+  for (;;) {
+    const page = await stripe.subscriptions.list(Object.assign(
+      { status: 'past_due', price: SUBSCRIPTION_PRICE_ID, limit: 100, expand: ['data.latest_invoice', 'data.customer'] },
+      startingAfter ? { starting_after: startingAfter } : {}
+    ));
+    for (const sub of page.data) {
+      const inv = sub.latest_invoice;
+      if (!inv || typeof inv !== 'object' || inv.status !== 'open' || !inv.hosted_invoice_url || inv.created < since) { continue; }
+      const cust = sub.customer && typeof sub.customer === 'object' ? sub.customer : null;
+      const email = (sub.metadata && sub.metadata.email) || (cust && cust.email) || '';
+      if (!email) { continue; }
+      out.push({ subscriptionId: sub.id, invoiceId: inv.id, email: email.trim(), name: (cust && cust.name) || '', payUrl: inv.hosted_invoice_url, amountEur: (inv.amount_due || 0) / 100 });
+    }
+    if (!page.has_more || page.data.length === 0) { break; }
+    startingAfter = page.data[page.data.length - 1].id;
+  }
+  return out;
+}
+
+async function sweepPastDue() {
+  if (!process.env.SMTP_USER || !process.env.SMTP_PASS) { return; }
+  let rows;
+  try { rows = await listPastDueRenewals(); }
+  catch (err) { console.error('[plus] past_due: could not list —', err.message); return; }
+  for (const r of rows) {
+    if (!db.claimDunningNotice(r.invoiceId, r.subscriptionId, r.email)) { continue; }   // already written to
+    try {
+      const who = db.findBirthDateByEmail(r.email);
+      const mail = plusDunning.renderPastDueEmail({
+        name:      (who && who.name) || r.name || '',
+        amountEur: r.amountEur || 19,
+        payUrl:    r.payUrl,
+        support:   process.env.SMTP_USER || 'support@lignaggio.it',
+      });
+      await sendEmail({ to: r.email, fromName: PLUS_FROM_NAME, subject: mail.subject, html: mail.html });
+      db.markDunningSent(r.invoiceId);
+      console.log('[plus] past_due notice sent to', r.email, 'for', r.subscriptionId, '/', r.invoiceId);
+    } catch (err) {
+      console.error('[plus] past_due notice failed for', r.email, '—', err.message);
+      if (!isPermanentSmtpFailure(err)) { db.releaseDunningNotice(r.invoiceId); }
+    }
+  }
+}
+
+setInterval(sweepPastDue, DUNNING_SWEEP_MS);
+
+// ── The second guide, in one tap ──────────────────────────────────────────────
+// After a lineage/strega purchase the thank-you page offers a guide for
+// someone else (a child, a parent, a partner): same PDFs, another archetype,
+// charged on the card Stripe saved at the first purchase. The new
+// PaymentIntent carries `selected_price: '2.99'`, which is NOT an
+// auto-subscription key, so it can never start a second trial.
+
+app.get('/api/quiz/second-guide/config', function (req, res) {
+  res.set('Cache-Control', 'no-store');
+  res.json({ enabled: SECOND_GUIDE_ENABLED, amount: SECOND_GUIDE_AMOUNT / 100, relations: SECOND_GUIDE_RELATIONS });
+});
+
+app.post('/api/quiz/second-guide', async function (req, res) {
+  if (!SECOND_GUIDE_ENABLED) { return res.status(404).json({ success: false, error: 'disabled' }); }
+  const b = req.body || {};
+  const piId = String(b.pi || '').trim();
+  const arch2 = parseInt(b.arch, 10);
+  const relation = String(b.relation || '').trim();
+  const name2 = String(b.name || '').trim().slice(0, 40);
+  if (!/^pi_[A-Za-z0-9_]{6,}$/.test(piId)) { return res.status(400).json({ success: false, error: 'invalid_payment_intent_id' }); }
+  if (!(arch2 >= 1 && arch2 <= 9)) { return res.status(400).json({ success: false, error: 'invalid_archetype' }); }
+  if (SECOND_GUIDE_RELATIONS.indexOf(relation) === -1) { return res.status(400).json({ success: false, error: 'invalid_relation' }); }
+  if (secondGuideRateLimited(piId)) { return res.status(429).json({ success: false, error: 'too_many_attempts' }); }
+
+  let parent;
+  try { parent = await stripe.paymentIntents.retrieve(piId); }
+  catch (err) {
+    if (err && err.statusCode === 404) { return res.status(404).json({ success: false, error: 'not_found' }); }
+    console.error('[second-guide] Stripe lookup failed for', piId, '—', err.message);
+    return res.status(502).json({ success: false, error: 'stripe_lookup_failed' });
+  }
+  const md = parent.metadata || {};
+  if (parent.status !== 'succeeded') { return res.status(403).json({ success: false, error: 'not_paid' }); }
+  if (!FIRST_PURCHASE_KEYS.has(String(md.selected_price || '')) || md.calculation_id) {
+    return res.status(403).json({ success: false, error: 'not_a_first_purchase' });
+  }
+  if (!parent.customer || !parent.payment_method) {
+    return res.json({ success: false, reason: 'no_saved_card' });
+  }
+  const quiz = quizReminders.quizOf(md);
+  const customerId = typeof parent.customer === 'string' ? parent.customer : parent.customer.id;
+  const paymentMethodId = typeof parent.payment_method === 'string' ? parent.payment_method : parent.payment_method.id;
+  try {
+    if (await countSecondGuides(customerId, parent.id) >= SECOND_GUIDE_MAX_PER_ORDER) {
+      return res.status(403).json({ success: false, error: 'limit_reached' });
+    }
+  } catch (err) {
+    console.error('[second-guide] could not count earlier guides for', parent.id, '—', err.message);
+    return res.status(502).json({ success: false, error: 'stripe_lookup_failed' });
+  }
+  const description = (quiz === 'str' ? 'Archetipi della Strega' : 'Matrice del Lignaggio') + ' — seconda guida: Archetipo ' + arch2 + ' (' + relation + ')';
+  // Same person, same archetype, within two minutes = the same tap. Later, a
+  // declined attempt can be retried with a fresh key instead of a replayed error.
+  const idemKey = 'second_' + parent.id + '_' + arch2 + '_' + relation + '_' + require('crypto').createHash('sha1').update(name2).digest('hex').slice(0, 8) + '_' + Math.floor(Date.now() / 120000);
+  try {
+    const intent = await stripe.paymentIntents.create({
+      amount:         SECOND_GUIDE_AMOUNT,
+      currency:       'eur',
+      customer:       customerId,
+      payment_method: paymentMethodId,
+      off_session:    true,
+      confirm:        true,
+      receipt_email:  parent.receipt_email || md.email || undefined,
+      description:    description,
+      metadata: {
+        email:          md.email || parent.receipt_email || '',
+        arch:           String(arch2),
+        selected_price: '2.99',                      // not an auto-subscription key
+        product:        'second_guide',
+        parent_pi:      parent.id,
+        relation:       relation,
+        for_name:       name2,
+        quiz:           quiz,
+      },
+    }, {
+      idempotencyKey: idemKey,
+    });
+    if (intent.status === 'succeeded') {
+      console.log('[second-guide] Charged', SECOND_GUIDE_AMOUNT, 'for arch', arch2, 'from', parent.id, '→', intent.id);
+      return res.json({ success: true, pi: intent.id, arch: arch2 });
+    }
+    if (intent.status === 'requires_action') {
+      return res.json({ success: false, fallback: 'authenticate', pi: intent.id, clientSecret: intent.client_secret, paymentMethod: paymentMethodId });
+    }
+    console.log('[second-guide] Not completed for', parent.id, '—', intent.status);
+    return res.json({ success: false, reason: intent.status });
+  } catch (err) {
+    const raw = err && err.raw && err.raw.payment_intent;
+    if (err && err.code === 'authentication_required' && raw && raw.client_secret) {
+      // The bank wants the customer present: the page confirms with the same
+      // card (its id rides along, since Stripe detaches it from the failed intent).
+      const pm = (raw.last_payment_error && raw.last_payment_error.payment_method && raw.last_payment_error.payment_method.id) || paymentMethodId;
+      return res.json({ success: false, fallback: 'authenticate', pi: raw.id, clientSecret: raw.client_secret, paymentMethod: pm });
+    }
+    console.warn('[second-guide] Charge failed for', parent.id, '—', err.code || err.type || '', err.message);
+    return res.json({ success: false, reason: err.code || 'charge_failed' });
+  }
+});
 
 // GET /api/monthly/stop?e=…&t=… — one-click unsubscribe from the email footer.
 //
@@ -4375,6 +4646,16 @@ app.get('/api/admin/monthly', adminAuth, function (req, res) {
     });
   } catch (err) {
     console.error('[admin/monthly]', err.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+// GET /api/admin/quiz-leads — lineage/strega leads, reminders sent, paid after a reminder.
+app.get('/api/admin/quiz-leads', adminAuth, function (req, res) {
+  try {
+    res.json({ stats: db.getQuizLeadStats(), recent: db.getRecentQuizLeads(), reminderHours: [QUIZ_REMINDER1_MS / 3600000, QUIZ_REMINDER2_MS / 3600000] });
+  } catch (err) {
+    console.error('[admin/quiz-leads]', err.message);
     res.status(500).json({ error: 'server_error' });
   }
 });
