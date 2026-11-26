@@ -276,6 +276,24 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_quiz_leads_pair ON quiz_leads (email, quiz);
 
+  -- Every PaymentIntent the lineage / strega quizzes create: opened checkouts
+  -- and paid guides, by quiz. Written live (intent created, webhook, second
+  -- guide) and refreshed from Stripe by the admin "sync", which also backfills
+  -- the months before this table existed. Amounts in cents.
+  CREATE TABLE IF NOT EXISTS quiz_payments (
+    pi         TEXT PRIMARY KEY,
+    quiz       TEXT NOT NULL,              -- 'lin' | 'str'
+    arch       INTEGER,
+    product    TEXT NOT NULL DEFAULT 'guide',   -- 'guide' | 'second_guide'
+    price_key  TEXT,
+    amount     INTEGER NOT NULL DEFAULT 0,
+    status     TEXT NOT NULL,              -- Stripe status ('succeeded' = paid)
+    email      TEXT,                       -- lower-cased
+    created_at INTEGER NOT NULL,
+    paid_at    INTEGER
+  );
+  CREATE INDEX IF NOT EXISTS idx_quiz_payments_quiz ON quiz_payments (quiz, created_at);
+
   -- One notice per failed renewal invoice of Lignaggio Plus. The claim is the
   -- primary key, so an hourly sweep can never send the same notice twice.
   CREATE TABLE IF NOT EXISTS dunning_notices (
@@ -624,6 +642,167 @@ const stmtRecentQuizLeads = db.prepare(`
   SELECT calculation_id, quiz, email, name, arch, arch_name, created_at, paid_at, reminder1_at, reminder2_at, last_error
     FROM quiz_leads ORDER BY created_at DESC LIMIT 60
 `);
+
+// ── Quiz payments + per-quiz stats (lineage / strega) ────────────────────────
+const stmtRecordQuizPayment = db.prepare(`
+  INSERT INTO quiz_payments (pi, quiz, arch, product, price_key, amount, status, email, created_at, paid_at)
+  VALUES (@pi, @quiz, @arch, @product, @price_key, @amount, @status, @email, @created_at, @paid_at)
+  ON CONFLICT(pi) DO UPDATE SET
+    status     = CASE WHEN quiz_payments.status = 'succeeded' THEN 'succeeded' ELSE excluded.status END,
+    amount     = CASE WHEN excluded.amount > 0 THEN excluded.amount ELSE quiz_payments.amount END,
+    arch       = COALESCE(excluded.arch, quiz_payments.arch),
+    price_key  = COALESCE(NULLIF(excluded.price_key, ''), quiz_payments.price_key),
+    email      = COALESCE(NULLIF(excluded.email, ''), quiz_payments.email),
+    paid_at    = COALESCE(excluded.paid_at, quiz_payments.paid_at)
+`);
+
+const stmtQuizPayStats = db.prepare(`
+  SELECT
+    COUNT(DISTINCT CASE WHEN product = 'guide' THEN COALESCE(NULLIF(email, ''), pi) END)                           AS checkouts,
+    SUM(CASE WHEN product = 'guide' AND status = 'succeeded' THEN 1 ELSE 0 END)                                       AS paid,
+    COALESCE(SUM(CASE WHEN product = 'guide' AND status = 'succeeded' THEN amount ELSE 0 END), 0)                     AS revenue,
+    SUM(CASE WHEN product = 'second_guide' AND status = 'succeeded' THEN 1 ELSE 0 END)                                AS second_count,
+    COALESCE(SUM(CASE WHEN product = 'second_guide' AND status = 'succeeded' THEN amount ELSE 0 END), 0)              AS second_revenue,
+    SUM(CASE WHEN product = 'guide' AND status = 'succeeded' AND created_at >= @today THEN 1 ELSE 0 END)              AS paid_today,
+    COALESCE(SUM(CASE WHEN product = 'guide' AND status = 'succeeded' AND created_at >= @today THEN amount ELSE 0 END), 0) AS revenue_today
+  FROM quiz_payments
+  WHERE quiz = @quiz AND created_at >= @since
+`);
+
+const stmtQuizPayByPrice = db.prepare(`
+  SELECT price_key, COUNT(*) AS paid, COALESCE(SUM(amount), 0) AS revenue
+    FROM quiz_payments
+   WHERE quiz = @quiz AND product = 'guide' AND status = 'succeeded' AND created_at >= @since
+   GROUP BY price_key ORDER BY CAST(price_key AS REAL)
+`);
+
+/* People, not attempts: the step down creates a second intent for the same
+   person, and someone who paid in the end is not "unpaid" at any price. */
+const stmtQuizPayUnpaidByPrice = db.prepare(`
+  SELECT q.price_key, COUNT(DISTINCT COALESCE(NULLIF(q.email, ''), q.pi)) AS n
+    FROM quiz_payments q
+   WHERE q.quiz = @quiz AND q.product = 'guide' AND q.status != 'succeeded' AND q.created_at >= @since
+     AND NOT EXISTS (SELECT 1 FROM quiz_payments s
+                      WHERE s.quiz = q.quiz AND s.product = 'guide' AND s.status = 'succeeded'
+                        AND s.email = q.email AND q.email != '')
+   GROUP BY q.price_key ORDER BY CAST(q.price_key AS REAL)
+`);
+
+const stmtQuizVisitsByPage = db.prepare(`
+  SELECT page,
+         SUM(count) AS period,
+         SUM(CASE WHEN day >= @today THEN count ELSE 0 END) AS today
+    FROM visit_counts
+   WHERE page LIKE @like AND day >= @since
+   GROUP BY page
+`);
+
+const stmtQuizLeadStatsPeriod = db.prepare(`
+  SELECT COUNT(*) AS leads,
+         SUM(CASE WHEN reminder1_at IS NOT NULL THEN 1 ELSE 0 END) AS reminded,
+         SUM(CASE WHEN paid_at IS NOT NULL THEN 1 ELSE 0 END) AS paid,
+         SUM(CASE WHEN paid_at IS NOT NULL AND reminder1_at IS NOT NULL AND paid_at > reminder1_at THEN 1 ELSE 0 END) AS paid_after_reminder
+    FROM quiz_leads WHERE quiz = @quiz AND created_at >= @since
+`);
+
+const stmtQuizDailyPayments = db.prepare(`
+  SELECT (created_at / 86400000) * 86400000 AS day,
+         COUNT(DISTINCT CASE WHEN product = 'guide' THEN COALESCE(NULLIF(email, ''), pi) END) AS checkouts,
+         SUM(CASE WHEN product = 'guide' AND status = 'succeeded' THEN 1 ELSE 0 END) AS paid,
+         COALESCE(SUM(CASE WHEN product = 'guide' AND status = 'succeeded' THEN amount ELSE 0 END), 0) AS revenue
+    FROM quiz_payments
+   WHERE quiz = @quiz AND created_at >= @since
+   GROUP BY day
+`);
+
+const stmtQuizDailyVisits = db.prepare(`
+  SELECT day, SUM(count) AS opens
+    FROM visit_counts
+   WHERE page = @page AND day >= @since
+   GROUP BY day
+`);
+
+/**
+ * Remembers (or refreshes) one PaymentIntent of the lineage / strega quizzes.
+ * @param {{pi: string, quiz: string, arch?: number, product?: string, priceKey?: string,
+ *          amount?: number, status: string, email?: string, createdAt?: number, paidAt?: number}} p
+ */
+function recordQuizPayment(p) {
+  if (!p || !p.pi || !p.quiz || !p.status) { return false; }
+  const arch = parseInt(p.arch, 10);
+  stmtRecordQuizPayment.run({
+    pi:         String(p.pi),
+    quiz:       String(p.quiz),
+    arch:       arch >= 1 && arch <= 9 ? arch : null,
+    product:    p.product === 'second_guide' ? 'second_guide' : 'guide',
+    price_key:  String(p.priceKey || ''),
+    amount:     Math.max(0, parseInt(p.amount, 10) || 0),
+    status:     String(p.status),
+    email:      String(p.email || '').trim().toLowerCase(),
+    created_at: p.createdAt || Date.now(),
+    paid_at:    p.paidAt || (p.status === 'succeeded' ? (p.createdAt || Date.now()) : null),
+  });
+  return true;
+}
+
+function getQuizPayment(pi) {
+  return db.prepare('SELECT * FROM quiz_payments WHERE pi = ?').get(String(pi || '')) || null;
+}
+
+/**
+ * Everything the admin panel shows for one quiz over the last `days` days:
+ * page opens, leads, checkouts, paid guides, revenue, price split, daily rows.
+ */
+function getQuizStats(quiz, days) {
+  const now = Date.now();
+  const today = now - (now % 86400000);
+  const since = now - days * 86400000;
+  const sinceDay = since - (since % 86400000);
+
+  const pages = {};
+  for (const r of stmtQuizVisitsByPage.all({ like: quiz + ':%', since: sinceDay, today: today })) {
+    pages[r.page.slice(quiz.length + 1)] = { period: r.period || 0, today: r.today || 0 };
+  }
+  const pay = stmtQuizPayStats.get({ quiz: quiz, since: since, today: today }) || {};
+  const leads = stmtQuizLeadStatsPeriod.get({ quiz: quiz, since: since }) || {};
+  const prices = stmtQuizPayByPrice.all({ quiz: quiz, since: since }).map(function (r) {
+    return { price: r.price_key, paid: r.paid || 0, revenue: (r.revenue || 0) / 100 };
+  });
+  const unpaid = {};
+  for (const r of stmtQuizPayUnpaidByPrice.all({ quiz: quiz, since: since })) { unpaid[r.price_key] = r.n; }
+
+  const dailyDays = Math.min(days, 14);
+  const dailySince = today - (dailyDays - 1) * 86400000;
+  const byDay = {};
+  for (let i = 0; i < dailyDays; i++) { const d = dailySince + i * 86400000; byDay[d] = { day: d, opens: 0, checkouts: 0, paid: 0, revenue: 0 }; }
+  for (const r of stmtQuizDailyVisits.all({ page: quiz + ':index', since: dailySince })) { if (byDay[r.day]) { byDay[r.day].opens = r.opens || 0; } }
+  for (const r of stmtQuizDailyPayments.all({ quiz: quiz, since: dailySince })) {
+    if (byDay[r.day]) { byDay[r.day].checkouts = r.checkouts || 0; byDay[r.day].paid = r.paid || 0; byDay[r.day].revenue = (r.revenue || 0) / 100; }
+  }
+
+  const paid = pay.paid || 0, checkouts = pay.checkouts || 0;
+  const opens = (pages.index && pages.index.period) || 0;
+  return {
+    quiz: quiz,
+    days: days,
+    pages: pages,
+    opens: opens,
+    starts: (pages.quiz && pages.quiz.period) || 0,
+    leads: { total: leads.leads || 0, reminded: leads.reminded || 0, paid: leads.paid || 0, paidAfterReminder: leads.paid_after_reminder || 0 },
+    checkouts: checkouts,
+    paid: paid,
+    paidToday: pay.paid_today || 0,
+    revenue: (pay.revenue || 0) / 100,
+    revenueToday: (pay.revenue_today || 0) / 100,
+    aov: paid ? Number(((pay.revenue || 0) / 100 / paid).toFixed(2)) : 0,
+    checkoutRate: checkouts ? Math.min(100, Number((paid / checkouts * 100).toFixed(1))) : 0,
+    visitRate: opens ? Number((paid / opens * 100).toFixed(2)) : 0,
+    second: { count: pay.second_count || 0, revenue: (pay.second_revenue || 0) / 100 },
+    prices: prices,
+    unpaidByPrice: unpaid,
+    daily: Object.keys(byDay).sort().map(function (k) { return byDay[k]; }),
+  };
+}
 
 // ── Lignaggio Plus dunning ledger ────────────────────────────────────────────
 const stmtClaimDunning = db.prepare(`
@@ -1952,6 +2131,21 @@ const KNOWN_PAGES = new Set([
   'result', 'cookie', 'privacy', 'terms',
 ]);
 
+/* The lineage and strega quizzes tag their opens with the quiz ('lin:index',
+   'str:offer'…), so they stop blending into the couple-quiz counters above. */
+const QUIZ_PREFIXES = ['lin:', 'str:'];
+const QUIZ_PAGES = new Set(['index', 'quiz', 'analysis', 'offer', 'grazie', 'cookie', 'privacy', 'terms']);
+
+function safeVisitPage(name) {
+  for (const prefix of QUIZ_PREFIXES) {
+    if (name.indexOf(prefix) === 0) {
+      const rest = name.slice(prefix.length);
+      return prefix + (QUIZ_PAGES.has(rest) ? rest : 'altro');
+    }
+  }
+  return KNOWN_PAGES.has(name) ? name : 'altro';
+}
+
 const stmtRecordVisit = db.prepare(`
   INSERT INTO visit_counts (day, page, count) VALUES (@day, @page, 1)
   ON CONFLICT(day, page) DO UPDATE SET count = count + 1
@@ -1977,7 +2171,7 @@ function recordVisit(page, source) {
   const name = String(page || '').trim().toLowerCase();
   const now  = Date.now();
   const day  = now - (now % 86400000);          // midnight UTC
-  const safePage = KNOWN_PAGES.has(name) ? name : 'altro';
+  const safePage = safeVisitPage(name);
 
   stmtRecordVisit.run({ day, page: safePage });
 
@@ -2002,12 +2196,13 @@ function getVisitStats() {
       COALESCE(SUM(CASE WHEN day >= ? THEN count ELSE 0 END), 0) AS week,
       COALESCE(SUM(count), 0)                                    AS total
     FROM visit_counts
+    WHERE page NOT LIKE '%:%'
   `).get(dayStart, weekAgo);
 
   const byPage = db.prepare(`
     SELECT page, SUM(count) AS count
     FROM visit_counts
-    WHERE day >= ?
+    WHERE day >= ? AND page NOT LIKE '%:%'
     GROUP BY page
     ORDER BY count DESC
   `).all(weekAgo);
@@ -2108,6 +2303,9 @@ module.exports = {
   getRecentQuizLeads,
   claimDunningNotice,
   markDunningSent,
+  recordQuizPayment,
+  getQuizPayment,
+  getQuizStats,
   releaseDunningNotice,
   getDunningNotice,
   isMonthlyOptedOut,

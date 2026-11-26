@@ -294,6 +294,7 @@ app.post(
         // affect delivery of the paid product.
         dispatchKeitaroSale(paymentIntent);
         settleQuizLead(paymentIntent);
+        rememberQuizPaymentIntent(paymentIntent);
 
         // ── New compatibility quiz: mark result as paid, persist to DB ──────────
         const calculationId = metadata.calculation_id;
@@ -734,6 +735,7 @@ app.post('/create-payment-intent', async (req, res) => {
     if (calculation_id && email) {
       try { db.saveSessionEmail(calculation_id, email); } catch (_) {}
     }
+    rememberQuizPaymentIntent(paymentIntent);
 
     res.json({ clientSecret: paymentIntent.client_secret });
   } catch (error) {
@@ -2009,7 +2011,7 @@ app.get('/api/payment-status/:pi', async (req, res) => {
   try {
     const pi = await stripe.paymentIntents.retrieve(piId);
     const md = pi.metadata || {};
-    if (pi.status === 'succeeded') { settleQuizLead(pi); }
+    if (pi.status === 'succeeded') { settleQuizLead(pi); rememberQuizPaymentIntent(pi); }
     res.set('Cache-Control', 'no-store');
     return res.json({
       success: true,
@@ -3244,6 +3246,71 @@ function settleQuizLead(pi) {
   } catch (err) {
     console.error('[leads] could not settle', err.message);
   }
+}
+
+/**
+ * Keeps quiz_payments in step with a PaymentIntent of the lineage / strega
+ * quizzes (any status). Couple-quiz intents (calculation_id) are ignored.
+ */
+function rememberQuizPaymentIntent(pi) {
+  const md = (pi && pi.metadata) || {};
+  if (md.calculation_id) { return false; }
+  const quiz = quizReminders.quizOf(md);
+  if (!quiz) { return false; }
+  try {
+    return db.recordQuizPayment({
+      pi:        pi.id,
+      quiz:      quiz,
+      arch:      md.arch,
+      product:   md.product === 'second_guide' ? 'second_guide' : 'guide',
+      priceKey:  String(md.selected_price || ''),
+      amount:    pi.status === 'succeeded' ? (pi.amount_received || pi.amount || 0) : (pi.amount || 0),
+      status:    pi.status,
+      email:     md.email || pi.receipt_email || '',
+      createdAt: (pi.created || 0) * 1000 || Date.now(),
+      paidAt:    pi.status === 'succeeded' ? ((pi.created || 0) * 1000 || Date.now()) : null,
+    });
+  } catch (err) {
+    console.error('[quiz-payments] could not record', pi && pi.id, '—', err.message);
+    return false;
+  }
+}
+
+/** Pulls every lineage / strega PaymentIntent of the last `days` days from Stripe. */
+async function syncQuizPaymentsFromStripe(days) {
+  const since = Math.floor(Date.now() / 1000) - days * 86400;
+  let scanned = 0, stored = 0;
+  for await (const pi of stripe.paymentIntents.list({ limit: 100, created: { gte: since } })) {
+    scanned++;
+    if (rememberQuizPaymentIntent(pi)) { stored++; }
+  }
+  return { days: days, scanned: scanned, stored: stored };
+}
+
+// Lignaggio Plus at a glance: counted from Stripe, cached ten minutes.
+let _plusSummaryCache = { at: 0, data: null, failedAt: 0 };
+async function getPlusSummary() {
+  if (_plusSummaryCache.data && Date.now() - _plusSummaryCache.at < 10 * 60 * 1000) { return _plusSummaryCache.data; }
+  // A Stripe hiccup is remembered for two minutes: the panel polls every ten seconds.
+  if (_plusSummaryCache.failedAt && Date.now() - _plusSummaryCache.failedAt < 2 * 60 * 1000) { return _plusSummaryCache.data; }
+  const out = { active: 0, trialing: 0, past_due: 0, mrr: 0, priceEur: 19 };
+  if (SUBSCRIPTION_PRICE_ID) {
+    for (const status of ['active', 'trialing', 'past_due']) {
+      let startingAfter;
+      for (;;) {
+        const page = await stripe.subscriptions.list(Object.assign({ price: SUBSCRIPTION_PRICE_ID, status: status, limit: 100 }, startingAfter ? { starting_after: startingAfter } : {}));
+        out[status] += page.data.length;
+        if (page.data.length && page.data[0].items && page.data[0].items.data[0] && page.data[0].items.data[0].price && page.data[0].items.data[0].price.unit_amount) {
+          out.priceEur = page.data[0].items.data[0].price.unit_amount / 100;
+        }
+        if (!page.has_more || page.data.length === 0) { break; }
+        startingAfter = page.data[page.data.length - 1].id;
+      }
+    }
+    out.mrr = Number((out.active * out.priceEur).toFixed(2));
+  }
+  _plusSummaryCache = { at: Date.now(), data: out, failedAt: 0 };
+  return out;
 }
 
 async function sendQuizReminder(lead, n) {
@@ -4647,6 +4714,42 @@ app.get('/api/admin/monthly', adminAuth, function (req, res) {
   } catch (err) {
     console.error('[admin/monthly]', err.message);
     res.status(500).json({ error: 'server_error' });
+  }
+});
+
+// GET /api/admin/quiz-stats?days=30 — the lineage and strega quizzes side by side,
+// plus a Lignaggio Plus summary and the monthly-reading tally of the current month.
+app.get('/api/admin/quiz-stats', adminAuth, async function (req, res) {
+  const days = Math.min(365, Math.max(1, parseInt(req.query.days, 10) || 30));
+  try {
+    let plus = null;
+    try { plus = await getPlusSummary(); } catch (err) { _plusSummaryCache.failedAt = Date.now(); console.warn('[admin/quiz-stats] Plus summary unavailable —', err.message); }
+    const period = romeToday().period;
+    res.set('Cache-Control', 'no-store');
+    res.json({
+      days:    days,
+      quizzes: { lin: db.getQuizStats('lin', days), str: db.getQuizStats('str', days) },
+      plus:    plus,
+      monthly: { period: period, stats: db.getMonthlyForecastStats(period) },
+      recentLeads: db.getRecentQuizLeads().slice(0, 20),
+    });
+  } catch (err) {
+    console.error('[admin/quiz-stats]', err.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+// POST /api/admin/quiz-payments/sync?days=120 — refresh quiz_payments from Stripe
+// (backfills the months before the table existed). Read-only on Stripe.
+app.post('/api/admin/quiz-payments/sync', adminAuth, async function (req, res) {
+  const days = Math.min(365, Math.max(1, parseInt(req.query.days, 10) || 120));
+  try {
+    const r = await syncQuizPaymentsFromStripe(days);
+    console.log('[quiz-payments] Synced from Stripe:', JSON.stringify(r));
+    res.json(Object.assign({ success: true }, r));
+  } catch (err) {
+    console.error('[admin/quiz-payments/sync]', err.message);
+    res.status(502).json({ success: false, error: 'stripe_lookup_failed' });
   }
 });
 
